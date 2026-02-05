@@ -6,22 +6,76 @@ on:
       - main
   workflow_dispatch:
 
+# Variables NON sensibles (Settings → Actions → Variables)
+env:
+  SERVER: ${{ secrets.SERVER }}
+  USER: ${{ secrets.USER }}
+  MOT: ${{ secrets.MOT }}
+
 jobs:
-  deploy-database:
-    name: Deploy Database
+  build-and-upload:
+    name: Build & Upload to S3
     runs-on: ubuntu-latest
+
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-pip \
+          sudo apt-get install -y \
+            bc uuid-runtime unzip curl \
             libpq-dev python3-dev build-essential
-          pip3 install psycopg2
 
-      - name: Deploy database
+      - name: Generate new version
         run: |
-          python3 createAllDB.py
+          CURRENT_VERSION=$(cat Grenoble_France/versionGrenoble.txt)
+          NEW_VERSION=$(uuidgen)
+          echo "$NEW_VERSION" > Grenoble_France/versionGrenoble.txt
+          echo "Old version: $CURRENT_VERSION"
+          echo "New version: $NEW_VERSION"
+
+      - name: Download ZIP from URL
+        run: |
+          URL=$(head -n 1 Grenoble_France/url.txt)
+          curl -L -o Grenoble_France/file.zip "$URL"
+          unzip -o Grenoble_France/file.zip -d Grenoble_France
+
+      - name: Generate DB file
+        run: |
+          chmod +x generateDB.sh
+          ./generateDB.sh Grenoble_France grenoble.db
+
+      - name: Upload Grenoble_France to S3
+        uses: jakejarvis/s3-sync-action@v0.5.1
+        with:
+          args: --acl public-read --delete
+        env:
+          AWS_S3_BUCKET: ${{ env.S3_BUCKET }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          SOURCE_DIR: Grenoble_France
+
+      - name: Upload BeloHorizonte_Brazil to S3
+        uses: jakejarvis/s3-sync-action@v0.5.1
+        with:
+          args: --acl public-read --delete
+        env:
+          AWS_S3_BUCKET: ${{ env.S3_BUCKET }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          SOURCE_DIR: BeloHorizonte_Brazil
+
+      - name: Upload GrenobleTransisere_France to S3
+        uses: jakejarvis/s3-sync-action@v0.5.1
+        with:
+          args: --acl public-read --delete
+        env:
+          AWS_S3_BUCKET: ${{ env.S3_BUCKET }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          SOURCE_DIR: GrenobleTransisere_France
+
+  de
