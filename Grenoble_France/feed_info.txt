@@ -1,0 +1,2 @@
+feed_publisher_name,feed_publisher_url,feed_lang,feed_id
+Mobilités M - Tag,https://www.mobilites-m.fr/,FR,SEM

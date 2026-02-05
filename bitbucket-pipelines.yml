@@ -1,0 +1,126 @@
+#  Template python-build
+
+#  This template allows you to validate your python code.
+#  The workflow allows running tests and code linting on the default branch.
+
+image: atlassian/default-image:3
+
+pipelines:
+  default:
+    - step:
+        name: Copy legacy files to bucket S3
+        script:
+          - apt -y update
+          - apt install -y bc
+          - apt install -y uuid-runtime
+          - cd $BITBUCKET_CLONE_DIR
+          - CURRENT_VERSION=$(cat Grenoble_France/versionGrenoble.txt)
+          - NEW_VERSION=$(uuidgen)
+          - echo "$NEW_VERSION" > Grenoble_France/versionGrenoble.txt
+          - apt-get install -y libpq-dev
+          - apt-get install -y python3-dev build-essential
+          - set +e
+          # Fetch the URL from the first line of the file
+          - URL=$(head -n 1 Grenoble_France/url.txt)
+          # Download the zip file using curl
+          - curl -o Grenoble_France/file.zip $URL
+          
+          # Unzip the downloaded file
+          - unzip Grenoble_France/file.zip -d Grenoble_France
+          
+          - sh generateDB.sh Grenoble_France grenoble.db
+          - set -e
+          - pipe: atlassian/aws-s3-deploy:0.3.8
+            variables:
+              AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+              AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+              AWS_DEFAULT_REGION: 'us-east-1'
+              S3_BUCKET: 'beyondmybus'
+              LOCAL_PATH: $BITBUCKET_CLONE_DIR/Grenoble_France
+              ACL: 'public-read'   
+          - pipe: atlassian/aws-s3-deploy:0.3.8
+            variables:
+              AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+              AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+              AWS_DEFAULT_REGION: 'us-east-1'
+              S3_BUCKET: 'beyondmybus'
+              LOCAL_PATH: $BITBUCKET_CLONE_DIR/BeloHorizonte_Brazil
+              ACL: 'public-read'               
+          - pipe: atlassian/aws-s3-deploy:0.3.8
+            variables:
+              AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+              AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+              AWS_DEFAULT_REGION: 'us-east-1'
+              S3_BUCKET: 'beyondmybus'
+              LOCAL_PATH: $BITBUCKET_CLONE_DIR/GrenobleTransisere_France
+              ACL: 'public-read'        
+    - step:
+        name: Deploy Database
+        script:
+          - cd $BITBUCKET_CLONE_DIR
+          - apt-get update
+          - apt install -y python3-pip
+          - apt-get install -y libpq-dev
+          - apt-get install -y python3-dev build-essential
+          - pip3 install psycopg2
+          - python3 createAllDB.py          
+    # - step:
+    #     name: Updating Stops
+    #     script:
+    #       - cd $BITBUCKET_CLONE_DIR
+    #       - apt-get update
+    #       - apt install -y python3-pip
+    #       - apt-get install -y libpq-dev
+    #       - apt-get install -y python3-dev build-essential
+    #       - pip3 install psycopg2
+    #       - pip3 install geopy
+    #       - python3 adjustStopsPoa.py          
+    # - parallel:
+    #   - step:
+    #       name: Update from 0 to 3000 Porto Alegre timetable
+    #       script:
+    #         - cd $BITBUCKET_CLONE_DIR
+    #         - apt-get update
+    #         - apt install -y python3-pip
+    #         - apt-get install -y libpq-dev
+    #         - apt-get install -y python3-dev build-essential
+    #         - pip3 install psycopg2
+    #         - python3 adjustTimes.py 0 3000
+    #   - step:
+    #       name: Update from 3000 to 6000 Porto Alegre timetable
+    #       script:
+    #         - apt-get update
+    #         - apt install -y python3-pip
+    #         - apt-get install -y libpq-dev
+    #         - apt-get install -y python3-dev build-essential
+    #         - pip3 install psycopg2
+    #         - python3 adjustTimes.py 3000 6000
+    #   - step:
+    #       name: Update from 6000 to 15000 Porto Alegre timetable
+    #       script:
+    #         - apt-get update
+    #         - apt install -y python3-pip
+    #         - apt-get install -y libpq-dev
+    #         - apt-get install -y python3-dev build-essential
+    #         - pip3 install psycopg2
+    #         - python3 adjustTimes.py 6000 15000
+
+    # - parallel:
+    #   - step:
+    #       name: Update from 15000 to 23000 Porto Alegre timetable
+    #       script:
+    #         - apt-get update
+    #         - apt install -y python3-pip
+    #         - apt-get install -y libpq-dev
+    #         - apt-get install -y python3-dev build-essential
+    #         - pip3 install psycopg2
+    #         - python3 adjustTimes.py 15000 23000
+    #   - step:
+    #       name: Update from 23000 to 230000 Porto Alegre timetable
+    #       script:
+    #         - apt-get update
+    #         - apt install -y python3-pip
+    #         - apt-get install -y libpq-dev
+    #         - apt-get install -y python3-dev build-essential
+    #         - pip3 install psycopg2
+    #         - python3 adjustTimes.py 23000 230000

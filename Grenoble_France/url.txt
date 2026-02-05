@@ -1,0 +1,1 @@
+https://data.mobilites-m.fr/api/gtfs/SEM
