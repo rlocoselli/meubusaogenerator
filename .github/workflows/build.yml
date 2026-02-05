@@ -15,6 +15,7 @@ jobs:
   deploy-database:
     name: Deploy Database
     runs-on: ubuntu-latest
+    environment: mybus
 
     steps:
       - name: Checkout repository
