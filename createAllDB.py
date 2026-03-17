@@ -9,6 +9,8 @@ import requests
 from Generator import calendar_dates, calendar, fare, route, shape, stops, stopstimes, trip
 from psycopg2 import errors, sql
 
+DEFAULT_INSECURE_SSL_HOSTS = {"www.meubusao.com"}
+
 def create_log_table(cursor):
     create_table_query = """
     CREATE TABLE IF NOT EXISTS log (
@@ -48,11 +50,14 @@ def _is_insecure_ssl_allowed(url):
     if _is_truthy_env_var(os.environ.get("ALLOW_INSECURE_SSL_DOWNLOAD")):
         return True
 
+    host = (urlparse(url).hostname or "").lower()
+    if host in DEFAULT_INSECURE_SSL_HOSTS:
+        return True
+
     host_allow_list = os.environ.get("ALLOW_INSECURE_SSL_HOSTS", "")
     if not host_allow_list.strip():
         return False
 
-    host = (urlparse(url).hostname or "").lower()
     allowed_hosts = {item.strip().lower() for item in host_allow_list.split(",") if item.strip()}
     return host in allowed_hosts
 
@@ -68,6 +73,7 @@ def download_and_unzip(url, destination, warning_handler):
                 "SSL certificate verification failed. "
                 "Fix server certificate chain or set ALLOW_INSECURE_SSL_DOWNLOAD=true "
                 "(or ALLOW_INSECURE_SSL_HOSTS=<host>) to force an insecure retry. "
+                f"Known default insecure hosts: {', '.join(sorted(DEFAULT_INSECURE_SSL_HOSTS))}. "
                 f"Original error: {err}"
             ) from err
 
