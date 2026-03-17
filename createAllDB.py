@@ -1,5 +1,6 @@
 import os
 import re
+from urllib.parse import urlparse
 import ddl
 from postgresConnection import getConnection
 from zipfile import ZipFile
@@ -36,8 +37,48 @@ def safe_log_message(admin_conn, message, level="INFO"):
         print(f"Original {level} log message: {message}")
 
 
-def download_and_unzip(url, destination):
-    response = requests.get(url, timeout=60)
+def _is_truthy_env_var(value):
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _is_insecure_ssl_allowed(url):
+    # Global switch to allow insecure SSL for all hosts.
+    if _is_truthy_env_var(os.environ.get("ALLOW_INSECURE_SSL_DOWNLOAD")):
+        return True
+
+    host_allow_list = os.environ.get("ALLOW_INSECURE_SSL_HOSTS", "")
+    if not host_allow_list.strip():
+        return False
+
+    host = (urlparse(url).hostname or "").lower()
+    allowed_hosts = {item.strip().lower() for item in host_allow_list.split(",") if item.strip()}
+    return host in allowed_hosts
+
+
+def download_and_unzip(url, destination, warning_handler):
+    verify_ssl = True
+
+    try:
+        response = requests.get(url, timeout=60, verify=verify_ssl)
+    except requests.exceptions.SSLError as err:
+        if not _is_insecure_ssl_allowed(url):
+            raise RuntimeError(
+                "SSL certificate verification failed. "
+                "Fix server certificate chain or set ALLOW_INSECURE_SSL_DOWNLOAD=true "
+                "(or ALLOW_INSECURE_SSL_HOSTS=<host>) to force an insecure retry. "
+                f"Original error: {err}"
+            ) from err
+
+        warning_handler(
+            "SSL certificate verification failed, retrying insecurely for "
+            f"{url}. This should be temporary and fixed at source."
+        )
+        verify_ssl = False
+        requests.packages.urllib3.disable_warnings()  # type: ignore[attr-defined]
+        response = requests.get(url, timeout=60, verify=verify_ssl)
+
     response.raise_for_status()
 
     zip_filename = os.path.join(destination, "data.zip")
@@ -188,7 +229,7 @@ def import_subdir(subdir, admin_conn):
         drop_and_create_tables(db_cursor)
 
         url = read_feed_url(url_file_path)
-        download_and_unzip(url, subdir)
+        download_and_unzip(url, subdir, warning_handler)
         warning_count += insert_data_from_generator(subdir, db_cursor, warning_handler)
         warning_count += create_indexes(db_cursor, warning_handler)
 

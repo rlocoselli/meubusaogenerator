@@ -1,15 +1,10 @@
 import csv
 import util.createColumnDoesNotExist
-from psycopg2 import errors
 
 def insert(file, c):
     print(file)
     c.execute("delete from route")
-
-    try:
-        c.execute("alter table route add favorite integer")
-    except errors.DuplicateColumn:
-        pass
+    c.execute("ALTER TABLE route ADD COLUMN IF NOT EXISTS favorite integer")
 
     try:
         with open(file, newline="", encoding="utf8") as csvfile:

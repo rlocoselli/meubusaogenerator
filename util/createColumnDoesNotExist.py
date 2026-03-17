@@ -1,4 +1,4 @@
-from psycopg2 import errors, sql
+from psycopg2 import sql
 
 
 def createColumn(cursor, columns, table):
@@ -7,13 +7,9 @@ def createColumn(cursor, columns, table):
         if not column:
             continue
 
-        try:
-            cursor.execute(
-                sql.SQL("ALTER TABLE {} ADD {} TEXT NULL").format(
-                    sql.Identifier(table),
-                    sql.Identifier(column),
-                )
+        cursor.execute(
+            sql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} TEXT NULL").format(
+                sql.Identifier(table),
+                sql.Identifier(column),
             )
-        except errors.DuplicateColumn:
-            # Column already exists and does not need to be recreated.
-            print(f"Warning: column already exists and is skipped: {table}.{column}")
+        )
