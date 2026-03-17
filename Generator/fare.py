@@ -2,16 +2,16 @@ import csv
 import util.createColumnDoesNotExist
 
 def insert(file, c):
+    print(file)
+    c.execute("delete from fare_attributes")
+
     try:
-        print(file)
-        c.execute ("delete from fare_attributes")
+        with open(file, newline="", encoding="utf8") as csvfile:
+            line = csvfile.readline().strip()
+            if not line:
+                raise ValueError(f"Missing CSV header in {file}")
 
-        with open(file, newline='') as csvfile:
-            line = csvfile.readline().replace("\n","")
-
-            util.createColumnDoesNotExist.createColumn(c,line,"fare_attributes")
-
+            util.createColumnDoesNotExist.createColumn(c, line, "fare_attributes")
             c.copy_expert("COPY fare_attributes (" + line + ") FROM STDIN (FORMAT CSV)", csvfile)
-
     except Exception as err:
-        print ("Error in generation",err)
+        raise RuntimeError(f"Failed to import {file} into fare_attributes: {err}") from err

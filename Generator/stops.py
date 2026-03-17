@@ -3,16 +3,17 @@ import util.replaceQuotesCSV
 import util.createColumnDoesNotExist
 
 def insert(file, c):
+    print(file)
+
+    c.execute("delete from stops")
+
     try:
-        print(file)
-        
-        c.execute ("delete from stops")
-            
-        with open(file, newline='', encoding="utf8") as csvfile:
-            line = csvfile.readline().replace("\n","")
+        with open(file, newline="", encoding="utf8") as csvfile:
+            line = csvfile.readline().strip()
+            if not line:
+                raise ValueError(f"Missing CSV header in {file}")
 
-            util.createColumnDoesNotExist.createColumn(c,line,"stops")
+            util.createColumnDoesNotExist.createColumn(c, line, "stops")
             c.copy_expert("COPY stops (" + line + ") FROM STDIN (FORMAT CSV)", csvfile)
-
     except Exception as err:
-        print ("Error in generation",err)
+        raise RuntimeError(f"Failed to import {file} into stops: {err}") from err

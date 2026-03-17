@@ -2,18 +2,19 @@ import csv
 import util.createColumnDoesNotExist
 
 def insert(file, c):
-    try:
-        print(file)
-        
-        c.execute ("delete from calendar_dates")
-        
-        with open(file, newline='') as csvfile:
-            line = csvfile.readline().replace("\n","")
+    print(file)
 
-            util.createColumnDoesNotExist.createColumn(c,line,"calendar_dates")
+    c.execute("delete from calendar_dates")
+
+    try:
+        with open(file, newline="", encoding="utf8") as csvfile:
+            line = csvfile.readline().strip()
+            if not line:
+                raise ValueError(f"Missing CSV header in {file}")
+
+            util.createColumnDoesNotExist.createColumn(c, line, "calendar_dates")
             c.copy_expert("COPY calendar_dates (" + line + ") FROM STDIN (FORMAT CSV)", csvfile)
 
-        c.execute ("UPDATE CALENDAR_DATES SET DATET = DATE WHERE DATET IS NULL")
-        
+        c.execute("UPDATE CALENDAR_DATES SET DATET = DATE WHERE DATET IS NULL")
     except Exception as err:
-        print ("Error in generation",err)
+        raise RuntimeError(f"Failed to import {file} into calendar_dates: {err}") from err
