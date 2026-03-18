@@ -156,6 +156,24 @@ def insert_data_from_generator(subdir, cursor, warning_handler):
     return warning_count
 
 
+# Databases whose GTFS calendar end_date should be extended to far-future
+# because the feed is no longer actively maintained/updated.
+_EXTEND_CALENDAR_DATABASES = {"Managua_Nicaragua"}
+
+
+def fix_expired_calendar(cursor, database_name, warning_handler):
+    """Set end_date to 20991231 in the calendar table for stale feeds."""
+    try:
+        cursor.execute("UPDATE calendar SET end_date = '20991231'")
+        warning_handler(
+            f"Calendar end_date extended to 20991231 for {database_name}"
+        )
+    except Exception as err:
+        warning_handler(
+            f"Failed to extend calendar end_date for {database_name}: {err}"
+        )
+
+
 def create_database_if_needed(admin_cursor, database_name):
     try:
         admin_cursor.execute(
@@ -237,6 +255,10 @@ def import_subdir(subdir, admin_conn):
         url = read_feed_url(url_file_path)
         download_and_unzip(url, subdir, warning_handler)
         warning_count += insert_data_from_generator(subdir, db_cursor, warning_handler)
+
+        if database_name in _EXTEND_CALENDAR_DATABASES:
+            fix_expired_calendar(db_cursor, database_name, warning_handler)
+
         warning_count += create_indexes(db_cursor, warning_handler)
 
         db_conn.commit()
