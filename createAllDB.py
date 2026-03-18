@@ -7,9 +7,26 @@ from zipfile import ZipFile
 from zipfile import BadZipFile
 import requests
 from Generator import calendar_dates, calendar, fare, route, shape, stops, stopstimes, trip
+from calculateDistanceStopsPostgres import GenerateTimes
 from psycopg2 import errors, sql
 
 DEFAULT_INSECURE_SSL_HOSTS = {"www.meubusao.com"}
+PORTO_ALEGRE_DATABASE = "PortoAlegre_Brazil"
+
+
+def _parse_database_filter_env(var_name):
+    raw_value = os.environ.get(var_name, "")
+    return {item.strip() for item in raw_value.split(",") if item.strip()}
+
+
+def should_process_database(database_name, included_databases=None, excluded_databases=None):
+    if included_databases and database_name not in included_databases:
+        return False
+
+    if excluded_databases and database_name in excluded_databases:
+        return False
+
+    return True
 
 def create_log_table(cursor):
     create_table_query = """
@@ -224,14 +241,28 @@ def create_indexes(cursor, warning_handler):
     return warning_count
 
 
+def apply_post_import_rules(database_name, cursor, conn, log_handler):
+    if database_name != PORTO_ALEGRE_DATABASE:
+        return
+
+    updated_rows = GenerateTimes(cursor, conn, None, None)
+    log_handler(
+        f"Interpolated missing stop times for {database_name} ({updated_rows} stop row(s) updated)",
+        level="INFO",
+    )
+
+
 def import_subdir(subdir, admin_conn):
     database_name = subdir.replace("./", "")
     url_file_path = os.path.join(subdir, "url.txt")
 
-    def warning_handler(message):
+    def log_handler(message, level="WARNING"):
         full_message = f"[{database_name}] {message}"
         print(full_message)
-        safe_log_message(admin_conn, full_message, level="WARNING")
+        safe_log_message(admin_conn, full_message, level=level)
+
+    def warning_handler(message):
+        log_handler(message, level="WARNING")
 
     with admin_conn.cursor() as admin_cursor:
         if not os.path.exists(url_file_path):
@@ -260,6 +291,7 @@ def import_subdir(subdir, admin_conn):
             fix_expired_calendar(db_cursor, database_name, warning_handler)
 
         warning_count += create_indexes(db_cursor, warning_handler)
+        apply_post_import_rules(database_name, db_cursor, db_conn, log_handler)
 
         db_conn.commit()
         if warning_count > 0:
@@ -290,6 +322,8 @@ def import_subdir(subdir, admin_conn):
 
 def main():
     subdirs = [x[0] for x in os.walk(".")]
+    included_databases = _parse_database_filter_env("INCLUDED_DATABASES")
+    excluded_databases = _parse_database_filter_env("EXCLUDED_DATABASES")
     admin_conn = getConnection("postgres")
 
     try:
@@ -301,6 +335,15 @@ def main():
 
         for subdir in subdirs:
             if "_" not in subdir or "__pycache__" in subdir:
+                continue
+
+            database_name = subdir.replace("./", "")
+            if not should_process_database(
+                database_name,
+                included_databases=included_databases,
+                excluded_databases=excluded_databases,
+            ):
+                print(f"Skipping import for {subdir}")
                 continue
 
             total += 1

@@ -1,147 +1,212 @@
-from datetime import datetime,timedelta
-import sys
-import sqlite3
-from Distance import getDistance
+def GenerateTimes(c, conn, startPoint=None, endPoint=None):
+    del conn
 
-def CalculateTimDifference(time1,time2):
-    
-    t1 = time1.split(":")
-    t2 = time2.split(":")
-    
-    a = datetime(2017, 5, 21, int(t1[0]), int(t1[1]), 00)
-    
-    if int(t2[0]) == 24:
-        b = datetime(2017, 6, 21, 00, int(t2[1]), 00)
-    else:
-        b = datetime(2017, 5, 21, int(t2[0]), int(t2[1]), 00)
+    c.execute(
+        "ALTER TABLE stopstime ADD COLUMN IF NOT EXISTS distanceRelatedToPreviousStop double precision"
+    )
+    c.execute(
+        "ALTER TABLE stopstime ADD COLUMN IF NOT EXISTS percentageTotalDistance double precision"
+    )
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_stopstime_trip_sequence ON stopstime (trip_id, stop_sequence)"
+    )
 
-    c = b-a
+    params = {
+        "start_point": startPoint,
+        "end_point": endPoint,
+    }
 
-    return c.total_seconds()
+    c.execute(
+        """
+        WITH selected_trips AS (
+            SELECT trip_id
+            FROM (
+                SELECT trip_id, ROW_NUMBER() OVER (ORDER BY trip_id) AS trip_position
+                FROM trip
+            ) ranked
+            WHERE (%(start_point)s IS NULL OR trip_position >= %(start_point)s)
+              AND (%(end_point)s IS NULL OR trip_position < %(end_point)s)
+        ),
+        last_stops AS (
+            SELECT DISTINCT ON (s.trip_id)
+                   s.trip_id,
+                   st.stop_name
+            FROM stopstime s
+            JOIN selected_trips selected ON selected.trip_id = s.trip_id
+            JOIN stops st ON st.stop_id = s.stop_id
+            ORDER BY s.trip_id, s.stop_sequence DESC
+        )
+        UPDATE trip t
+        SET trip_headsign = last_stops.stop_name
+        FROM last_stops
+        WHERE t.trip_id = last_stops.trip_id
+          AND COALESCE(t.trip_headsign, '') <> COALESCE(last_stops.stop_name, '')
+        """,
+        params,
+    )
 
-def GenerateTimes (c, conn,startPoint, endPoint):
-    try:
-        c.execute("alter table stopstime add distanceRelatedToPreviousStop float")
-    except Exception as err:
-        print ("Column distanceRelatedToPreviousStop already in place")
+    c.execute(
+        """
+        WITH selected_trips AS (
+            SELECT trip_id
+            FROM (
+                SELECT trip_id, ROW_NUMBER() OVER (ORDER BY trip_id) AS trip_position
+                FROM trip
+            ) ranked
+            WHERE (%(start_point)s IS NULL OR trip_position >= %(start_point)s)
+              AND (%(end_point)s IS NULL OR trip_position < %(end_point)s)
+        ),
+        ordered_stops AS (
+            SELECT
+                st.trip_id,
+                st.stop_id,
+                st.stop_sequence,
+                st.arrival_time,
+                st.departure_time,
+                stops.stop_lat::double precision AS stop_lat,
+                stops.stop_lon::double precision AS stop_lon,
+                LAG(stops.stop_lat::double precision) OVER (
+                    PARTITION BY st.trip_id
+                    ORDER BY st.stop_sequence
+                ) AS prev_stop_lat,
+                LAG(stops.stop_lon::double precision) OVER (
+                    PARTITION BY st.trip_id
+                    ORDER BY st.stop_sequence
+                ) AS prev_stop_lon,
+                ROW_NUMBER() OVER (
+                    PARTITION BY st.trip_id
+                    ORDER BY st.stop_sequence
+                ) AS stop_rank,
+                ROW_NUMBER() OVER (
+                    PARTITION BY st.trip_id
+                    ORDER BY st.stop_sequence DESC
+                ) AS reverse_stop_rank,
+                COUNT(*) OVER (PARTITION BY st.trip_id) AS stop_count
+            FROM stopstime st
+            JOIN selected_trips selected ON selected.trip_id = st.trip_id
+            JOIN stops ON stops.stop_id = st.stop_id
+        ),
+        distances AS (
+            SELECT
+                ordered_stops.*,
+                CASE
+                    WHEN prev_stop_lat IS NULL OR prev_stop_lon IS NULL THEN 0.0
+                    ELSE 2 * 6373.0 * ASIN(
+                        SQRT(
+                            POWER(SIN(RADIANS(stop_lat - prev_stop_lat) / 2), 2)
+                            + COS(RADIANS(prev_stop_lat))
+                            * COS(RADIANS(stop_lat))
+                            * POWER(SIN(RADIANS(stop_lon - prev_stop_lon) / 2), 2)
+                        )
+                    )
+                END AS distance_to_previous_stop,
+                MAX(
+                    CASE
+                        WHEN stop_rank = 1 THEN COALESCE(NULLIF(BTRIM(departure_time), ''), NULLIF(BTRIM(arrival_time), ''))
+                    END
+                ) OVER (PARTITION BY trip_id) AS first_stop_time,
+                MAX(
+                    CASE
+                        WHEN reverse_stop_rank = 1 THEN COALESCE(NULLIF(BTRIM(arrival_time), ''), NULLIF(BTRIM(departure_time), ''))
+                    END
+                ) OVER (PARTITION BY trip_id) AS last_stop_time,
+                MAX(
+                    CASE
+                        WHEN stop_rank NOT IN (1, stop_count)
+                             AND (
+                                 NULLIF(BTRIM(arrival_time), '') IS NULL
+                                 OR NULLIF(BTRIM(departure_time), '') IS NULL
+                             ) THEN 1
+                        ELSE 0
+                    END
+                ) OVER (PARTITION BY trip_id) AS has_missing_intermediate_times
+            FROM ordered_stops
+        ),
+        metrics AS (
+            SELECT
+                distances.*,
+                SUM(distance_to_previous_stop) OVER (PARTITION BY trip_id) AS total_distance,
+                SUM(distance_to_previous_stop) OVER (
+                    PARTITION BY trip_id
+                    ORDER BY stop_sequence
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) AS cumulative_distance,
+                CASE
+                    WHEN first_stop_time ~ '^\\d+:\\d{2}:\\d{2}$' THEN
+                        split_part(first_stop_time, ':', 1)::integer * 3600
+                        + split_part(first_stop_time, ':', 2)::integer * 60
+                        + split_part(first_stop_time, ':', 3)::integer
+                END AS first_stop_seconds,
+                CASE
+                    WHEN last_stop_time ~ '^\\d+:\\d{2}:\\d{2}$' THEN
+                        split_part(last_stop_time, ':', 1)::integer * 3600
+                        + split_part(last_stop_time, ':', 2)::integer * 60
+                        + split_part(last_stop_time, ':', 3)::integer
+                END AS last_stop_seconds
+            FROM distances
+        ),
+        interpolated AS (
+            SELECT
+                metrics.*,
+                CASE
+                    WHEN stop_count <= 1 THEN 0.0
+                    WHEN total_distance > 0 THEN cumulative_distance / total_distance
+                    ELSE (stop_rank - 1)::double precision / NULLIF(stop_count - 1, 0)
+                END AS progress_ratio,
+                CASE
+                    WHEN total_distance > 0 THEN distance_to_previous_stop / total_distance
+                    WHEN stop_count <= 1 THEN 0.0
+                    ELSE 1.0 / NULLIF(stop_count - 1, 0)
+                END AS segment_ratio,
+                CASE
+                    WHEN first_stop_seconds IS NULL OR last_stop_seconds IS NULL THEN NULL
+                    WHEN last_stop_seconds >= first_stop_seconds THEN last_stop_seconds - first_stop_seconds
+                    ELSE last_stop_seconds + 86400 - first_stop_seconds
+                END AS total_duration_seconds
+            FROM metrics
+        ),
+        estimated_times AS (
+            SELECT
+                interpolated.*,
+                CASE
+                    WHEN total_duration_seconds IS NULL THEN NULL
+                    ELSE first_stop_seconds + ROUND(total_duration_seconds * progress_ratio)::integer
+                END AS estimated_time_seconds
+            FROM interpolated
+        ),
+        updated_rows AS (
+            UPDATE stopstime target
+            SET arrival_time = CASE
+                    WHEN NULLIF(BTRIM(target.arrival_time), '') IS NULL AND estimated_times.estimated_time_seconds IS NOT NULL THEN
+                        LPAD((estimated_times.estimated_time_seconds / 3600)::text, 2, '0')
+                        || ':' || LPAD(((estimated_times.estimated_time_seconds %% 3600) / 60)::text, 2, '0')
+                        || ':' || LPAD((estimated_times.estimated_time_seconds %% 60)::text, 2, '0')
+                    ELSE target.arrival_time
+                END,
+                departure_time = CASE
+                    WHEN NULLIF(BTRIM(target.departure_time), '') IS NULL AND estimated_times.estimated_time_seconds IS NOT NULL THEN
+                        LPAD((estimated_times.estimated_time_seconds / 3600)::text, 2, '0')
+                        || ':' || LPAD(((estimated_times.estimated_time_seconds %% 3600) / 60)::text, 2, '0')
+                        || ':' || LPAD((estimated_times.estimated_time_seconds %% 60)::text, 2, '0')
+                    ELSE target.departure_time
+                END,
+                distanceRelatedToPreviousStop = estimated_times.distance_to_previous_stop,
+                percentageTotalDistance = estimated_times.segment_ratio
+            FROM estimated_times
+            WHERE target.trip_id = estimated_times.trip_id
+              AND target.stop_id = estimated_times.stop_id
+              AND target.stop_sequence = estimated_times.stop_sequence
+              AND estimated_times.has_missing_intermediate_times = 1
+              AND estimated_times.first_stop_seconds IS NOT NULL
+              AND estimated_times.last_stop_seconds IS NOT NULL
+            RETURNING 1
+        )
+        SELECT COUNT(*)
+        FROM updated_rows
+        """,
+        params,
+    )
 
-    try:
-        c.execute("alter table stopstime add percentageTotalDistance float")
-    except Exception as err:
-        print ("Column percentageTotalDistance already in place")
-    
-    c.execute("select trip_id from trip order by trip_id")
-    
-    rows = c.fetchall()
-
-    totalRows = len(rows)
-
-    i = 0
-
-    for row in rows:
-        
-        try:
-            i += 1
-            if i >= startPoint and i < endPoint:
-                #Fix trips based on stops
-                sqlFix = "update trip z set trip_headsign = stop_name from stops a, stopstime s where z.trip_id='" + row[0] + "' and s.trip_id = z.trip_id and a.stop_id = s.stop_id and stop_sequence in (select max (stop_sequence) from stopstime h where h.trip_id = z.trip_id)"
-                
-                c.execute (sqlFix)
-    
-                print("Record",i, "out of",totalRows)
-                
-                lat1 = 0
-                lat2 = 0
-                lon1 = 0
-                lon2 = 0
-                totalDistance = 0
-                firstTime = ""
-                lastTime = ""
-                firstDate = None
-
-                #Iterate trips to sum distance
-                sqlStops = "select departure_time, stop_lat, stop_lon, s.stop_id, stop_sequence from STOPSTIME s, STOPS s2 " \
-                        " where s.trip_id = '" + row[0] + "'" \
-                        " and   s.stop_id = s2.stop_id" \
-                        " order by stop_sequence"
-
-                c1 = conn.cursor()
-                c1.execute(sqlStops)
-                rowsStops = c1.fetchall()
-
-                for rowStops in rowsStops:
-                    
-                    if firstTime == "":
-                        firstTime = rowStops[0]
-                        t1 = firstTime.split(":")
-                        firstDate = datetime(2017, 5, 21, int(t1[0]), int(t1[1]), 00)
-                    
-                    lastTime = rowStops[0]
-
-                    if lat1 == 0:
-                        lat1 = rowStops[1]
-                        lon1 = rowStops[2]
-                    else:
-                        lat2 = rowStops[1]
-                        lon2 = rowStops[2]
-                        distance = getDistance(lat1,lon1,lat2,lon2)
-                        lat1 = lat2
-                        lon1 = lon2
-
-                        totalDistance += distance
-                        
-                        sqlUpdate = "update stopstime set distanceRelatedToPreviousStop = " + str(distance) + \
-                                    " where trip_id = %s" \
-                                    " and   stop_id = %s"
-                        
-                        c3 = conn.cursor()
-                        c3.execute(sqlUpdate,(row[0],rowStops[3]))
-
-                totalDifference = CalculateTimDifference(firstTime, lastTime)
-
-                #Iterate trips which do not contain time
-                sqlStops = "select arrival_time, stop_lat, stop_lon, s.stop_id, stop_sequence from STOPSTIME s, STOPS s2 " \
-                        " where s.trip_id = '" + row[0] + "'" \
-                        " and   s.stop_id = s2.stop_id" \
-                        " order by stop_sequence"
-
-                c1 = conn.cursor()
-                c1.execute(sqlStops)
-                rowsStops = c1.fetchall()
-
-                lat1 = 0
-                lat2 = 0
-                lon1 = 0
-                lon2 = 0
-
-                for rowStops in rowsStops:
-                    
-                    if lat1 == 0:
-                        lat1 = rowStops[1]
-                        lon1 = rowStops[2]
-                    else:
-                        lat2 = rowStops[1]
-                        lon2 = rowStops[2]
-                        distance = getDistance(lat1,lon1,lat2,lon2)
-                        lat1 = lat2
-                        lon1 = lon2
-
-                        percentageDistance = float(distance / totalDistance)
-                        secondsToAdd = totalDifference * percentageDistance
-
-                        firstDate = firstDate + timedelta(seconds=secondsToAdd)
-
-                        time = str(firstDate.time())[0:8]
-
-                        sqlUpdate = "update stopstime set arrival_time='" + time + "'" \
-                                    ",distanceRelatedToPreviousStop = " + str(distance) + \
-                                    " where trip_id = %s" \
-                                    " and   stop_id = %s"
-                        
-                        c3 = conn.cursor()
-                        c3.execute(sqlUpdate,(row[0],rowStops[3]))
-                        c3.close()
-                c1.close()
-        except Exception as err:
-            print("Error in trip",row[0])
-            print(err)
+    updated_rows = c.fetchone()[0]
+    print(f"Interpolated stop times for {updated_rows} stop rows")
+    return updated_rows

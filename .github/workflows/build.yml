@@ -7,6 +7,16 @@ on:
   schedule:
     - cron: '0 0 * * 0'
   workflow_dispatch:
+    inputs:
+      deployment_target:
+        description: Select which databases to deploy
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - all_except_porto
+          - porto_only
 
 env:
   SERVER: ${{ secrets.SERVER }}
@@ -14,10 +24,13 @@ env:
   MOT: ${{ secrets.MOT }}
 
 jobs:
-  deploy-database:
-    name: Deploy Database
+  deploy-databases:
+    name: Deploy Databases Except Porto Alegre
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.deployment_target == 'all' || github.event.inputs.deployment_target == 'all_except_porto'
     runs-on: ubuntu-latest
     environment: mybus
+    env:
+      EXCLUDED_DATABASES: PortoAlegre_Brazil
 
     steps:
       - name: Checkout repository
@@ -31,5 +44,29 @@ jobs:
           pip3 install psycopg2
 
       - name: Deploy database
+        run: |
+          python3 createAllDB.py
+
+  deploy-porto-alegre:
+    name: Deploy Porto Alegre Database
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.deployment_target == 'all' || github.event.inputs.deployment_target == 'porto_only'
+    runs-on: ubuntu-latest
+    environment: mybus
+    timeout-minutes: 60
+    env:
+      INCLUDED_DATABASES: PortoAlegre_Brazil
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip \
+            libpq-dev python3-dev build-essential
+          pip3 install psycopg2
+
+      - name: Deploy Porto Alegre database
         run: |
           python3 createAllDB.py
