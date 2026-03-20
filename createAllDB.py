@@ -58,8 +58,29 @@ def log_message(cursor, message, level="INFO"):
     cursor.execute(insert_query, (level, message))
 
 
-def safe_log_message(admin_conn, message, level="INFO"):
+def ensure_admin_connection(admin_conn):
+    if admin_conn is None or admin_conn.closed != 0:
+        return getConnection("postgres")
+
     try:
+        with admin_conn.cursor() as admin_cursor:
+            admin_cursor.execute("SELECT 1")
+        return admin_conn
+    except Exception:
+        try:
+            admin_conn.close()
+        except Exception:
+            pass
+        return getConnection("postgres")
+
+
+def safe_log_message(admin_conn, message, level="INFO"):
+    if admin_conn is None:
+        print(f"Original {level} log message: {message}")
+        return
+
+    try:
+        admin_conn = ensure_admin_connection(admin_conn)
         with admin_conn.cursor() as admin_cursor:
             log_message(admin_cursor, message, level)
     except Exception as err:
@@ -90,7 +111,7 @@ def _is_insecure_ssl_allowed(url):
     return host in allowed_hosts
 
 
-def download_and_unzip(url, destination, warning_handler):
+def _download_with_ssl_fallback(url, warning_handler):
     verify_ssl = True
 
     try:
@@ -114,29 +135,54 @@ def download_and_unzip(url, destination, warning_handler):
         response = requests.get(url, timeout=60, verify=verify_ssl)
 
     response.raise_for_status()
+    return response.content
+
+
+def download_and_unzip(urls, destination, warning_handler):
+    if isinstance(urls, str):
+        urls = [urls]
+
+    last_error = None
+    downloaded_content = None
+    selected_url = None
+
+    for candidate_url in urls:
+        try:
+            downloaded_content = _download_with_ssl_fallback(candidate_url, warning_handler)
+            selected_url = candidate_url
+            break
+        except Exception as err:
+            last_error = err
+            warning_handler(f"Failed downloading {candidate_url}: {err}")
+
+    if downloaded_content is None:
+        raise RuntimeError(
+            "Unable to download GTFS feed from all configured URLs. "
+            f"Last error: {last_error}"
+        )
 
     zip_filename = os.path.join(destination, "data.zip")
     with open(zip_filename, "wb") as f:
-        f.write(response.content)
+        f.write(downloaded_content)
 
     try:
         with ZipFile(zip_filename, "r") as zip_ref:
             zip_ref.extractall(destination)
     except BadZipFile as err:
-        raise RuntimeError(f"Downloaded file is not a valid zip from URL: {url}") from err
+        raise RuntimeError(f"Downloaded file is not a valid zip from URL: {selected_url}") from err
     finally:
         if os.path.exists(zip_filename):
             os.remove(zip_filename)
 
 
-def read_feed_url(url_file_path):
+def read_feed_urls(url_file_path):
     with open(url_file_path, "r", encoding="utf8") as url_file:
-        url = url_file.read().strip()
+        urls = [line.strip() for line in url_file if line.strip() and not line.strip().startswith("#")]
 
-    if not url:
+    if not urls:
         raise ValueError(f"URL file is empty: {url_file_path}")
 
-    return url
+    return urls
 
 
 def insert_data_from_generator(subdir, cursor, warning_handler):
@@ -501,12 +547,14 @@ def import_subdir(subdir, admin_conn):
     def warning_handler(message):
         log_handler(message, level="WARNING")
 
+    admin_conn = ensure_admin_connection(admin_conn)
+
     with admin_conn.cursor() as admin_cursor:
         if not os.path.exists(url_file_path):
             message = f"url.txt not found in {subdir}"
             print(message)
             log_message(admin_cursor, message, level="ERROR")
-            return report_item
+            return report_item, admin_conn
 
         create_database_if_needed(admin_cursor, database_name)
 
@@ -520,8 +568,8 @@ def import_subdir(subdir, admin_conn):
 
         drop_and_create_tables(db_cursor)
 
-        url = read_feed_url(url_file_path)
-        download_and_unzip(url, subdir, warning_handler)
+        urls = read_feed_urls(url_file_path)
+        download_and_unzip(urls, subdir, warning_handler)
         warning_count += insert_data_from_generator(subdir, db_cursor, warning_handler)
 
         if database_name in _EXTEND_CALENDAR_DATABASES:
@@ -546,7 +594,7 @@ def import_subdir(subdir, admin_conn):
 
         print(success_message)
         safe_log_message(admin_conn, success_message, level="INFO")
-        return report_item
+        return report_item, admin_conn
     except Exception as err:
         if db_conn is not None:
             db_conn.rollback()
@@ -554,7 +602,7 @@ def import_subdir(subdir, admin_conn):
         error_message = f"Import failed for {database_name}: {err}"
         print(error_message)
         safe_log_message(admin_conn, error_message, level="ERROR")
-        return report_item
+        return report_item, admin_conn
     finally:
         if db_cursor is not None:
             db_cursor.close()
@@ -608,7 +656,8 @@ def main():
             database_name = subdir.replace("./", "")
             gha_notice(f"Starting import for {database_name}")
             print(f"Starting import for {subdir}")
-            report_item = import_subdir(subdir, admin_conn)
+            admin_conn = ensure_admin_connection(admin_conn)
+            report_item, admin_conn = import_subdir(subdir, admin_conn)
             report_items.append(report_item)
             processed += 1
             if report_item.get("success"):

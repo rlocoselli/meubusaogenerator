@@ -14,6 +14,7 @@ def insert(file, c):
                 raise ValueError(f"Missing CSV header in {file}")
 
             util.createColumnDoesNotExist.createColumn(c, line, "stops")
-            c.copy_expert("COPY stops (" + line + ") FROM STDIN (FORMAT CSV)", csvfile)
+            copy_columns = util.createColumnDoesNotExist.format_copy_columns(line)
+            c.copy_expert("COPY stops (" + copy_columns + ") FROM STDIN (FORMAT CSV)", csvfile)
     except Exception as err:
         raise RuntimeError(f"Failed to import {file} into stops: {err}") from err

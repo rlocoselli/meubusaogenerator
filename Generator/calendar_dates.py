@@ -13,7 +13,8 @@ def insert(file, c):
                 raise ValueError(f"Missing CSV header in {file}")
 
             util.createColumnDoesNotExist.createColumn(c, line, "calendar_dates")
-            c.copy_expert("COPY calendar_dates (" + line + ") FROM STDIN (FORMAT CSV)", csvfile)
+            copy_columns = util.createColumnDoesNotExist.format_copy_columns(line)
+            c.copy_expert("COPY calendar_dates (" + copy_columns + ") FROM STDIN (FORMAT CSV)", csvfile)
 
         c.execute("UPDATE CALENDAR_DATES SET DATET = DATE WHERE DATET IS NULL")
     except Exception as err:

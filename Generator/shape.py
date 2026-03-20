@@ -13,6 +13,7 @@ def insert(file, c):
                 raise ValueError(f"Missing CSV header in {file}")
 
             util.createColumnDoesNotExist.createColumn(c, line, "shape")
-            c.copy_expert("COPY shape (" + line + ") FROM STDIN (FORMAT CSV)", csvfile)
+            copy_columns = util.createColumnDoesNotExist.format_copy_columns(line)
+            c.copy_expert("COPY shape (" + copy_columns + ") FROM STDIN (FORMAT CSV)", csvfile)
     except Exception as err:
         raise RuntimeError(f"Failed to import {file} into shape: {err}") from err
