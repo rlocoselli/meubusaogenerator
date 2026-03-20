@@ -4,8 +4,6 @@ import util.createColumnDoesNotExist
 def insert(file, c):
     print(file)
 
-    c.execute("delete from calendar_dates")
-
     try:
         with open(file, newline="", encoding="utf8") as csvfile:
             line = csvfile.readline().strip()

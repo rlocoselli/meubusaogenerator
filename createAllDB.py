@@ -1,5 +1,6 @@
 import os
 import re
+import time
 from urllib.parse import urlparse
 import ddl
 from postgresConnection import getConnection
@@ -266,6 +267,12 @@ def drop_and_create_tables(cursor):
         cursor.execute(table)
 
 
+def tune_import_session(cursor):
+    # Safe per-transaction settings to speed bulk ingest.
+    cursor.execute("SET LOCAL synchronous_commit TO OFF")
+    cursor.execute("SET LOCAL work_mem TO '64MB'")
+
+
 def create_indexes(cursor, warning_handler):
     warning_count = 0
 
@@ -447,19 +454,21 @@ def _build_report_markdown(report_items):
     lines = [
         "## GTFS Validation Report",
         "",
-        "| Database | Status | Warnings | Mirrored Arrivals | Mirrored Departures | Invalid Rows Removed | Duplicates Removed | Invalid Time Format Rows | Interpolated Total | Local Anchor | Global Fallback |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Database | Status | Warnings | Mirrored Arrivals | Mirrored Departures | Invalid Rows Removed | Duplicates Removed | Invalid Time Format Rows | Interpolated Total | Local Anchor | Global Fallback | Download(s) | Copy(s) | Index(s) | Post(s) | Total(s) |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
 
     for item in report_items:
         cleanup = item.get("cleanup", {})
         interpolation = item.get("interpolation", {})
+        timings = item.get("timings", {})
         status = "SUCCESS" if item.get("success") else "FAILED"
 
         lines.append(
             "| {database} | {status} | {warnings} | {mirrored_arrivals} | "
             "{mirrored_departures} | {removed_invalid_rows} | {removed_duplicates} | "
-            "{invalid_time_rows} | {updated_rows} | {local_anchor_rows} | {global_fallback_rows} |".format(
+            "{invalid_time_rows} | {updated_rows} | {local_anchor_rows} | {global_fallback_rows} | "
+            "{download_seconds} | {copy_seconds} | {index_seconds} | {post_import_seconds} | {total_seconds} |".format(
                 database=item.get("database", "unknown"),
                 status=status,
                 warnings=item.get("warning_count", 0),
@@ -471,6 +480,11 @@ def _build_report_markdown(report_items):
                 updated_rows=interpolation.get("updated_rows", 0),
                 local_anchor_rows=interpolation.get("local_anchor_rows", 0),
                 global_fallback_rows=interpolation.get("global_fallback_rows", 0),
+                download_seconds=f"{timings.get('download_seconds', 0.0):.2f}",
+                copy_seconds=f"{timings.get('copy_seconds', 0.0):.2f}",
+                index_seconds=f"{timings.get('index_seconds', 0.0):.2f}",
+                post_import_seconds=f"{timings.get('post_import_seconds', 0.0):.2f}",
+                total_seconds=f"{timings.get('total_seconds', 0.0):.2f}",
             )
         )
 
@@ -531,12 +545,14 @@ def publish_report_summary(report_items, total=0, processed=0, succeeded=0, fail
 def import_subdir(subdir, admin_conn):
     database_name = subdir.replace("./", "")
     url_file_path = os.path.join(subdir, "url.txt")
+    import_started_at = time.perf_counter()
     report_item = {
         "database": database_name,
         "success": False,
         "warning_count": 0,
         "cleanup": {},
         "interpolation": {},
+        "timings": {},
     }
 
     def log_handler(message, level="WARNING"):
@@ -560,29 +576,71 @@ def import_subdir(subdir, admin_conn):
 
     db_conn = None
     db_cursor = None
+    timings = {
+        "schema_seconds": 0.0,
+        "download_seconds": 0.0,
+        "copy_seconds": 0.0,
+        "index_seconds": 0.0,
+        "post_import_seconds": 0.0,
+        "commit_seconds": 0.0,
+        "total_seconds": 0.0,
+    }
     try:
         db_conn = getConnection(database_name)
         db_conn.autocommit = False
         db_cursor = db_conn.cursor()
         warning_count = 0
 
+        tune_import_session(db_cursor)
+
+        schema_started_at = time.perf_counter()
         drop_and_create_tables(db_cursor)
+        timings["schema_seconds"] = time.perf_counter() - schema_started_at
 
         urls = read_feed_urls(url_file_path)
+
+        download_started_at = time.perf_counter()
         download_and_unzip(urls, subdir, warning_handler)
+        timings["download_seconds"] = time.perf_counter() - download_started_at
+
+        copy_started_at = time.perf_counter()
         warning_count += insert_data_from_generator(subdir, db_cursor, warning_handler)
+        timings["copy_seconds"] = time.perf_counter() - copy_started_at
 
         if database_name in _EXTEND_CALENDAR_DATABASES:
             fix_expired_calendar(db_cursor, database_name, warning_handler)
 
+        index_started_at = time.perf_counter()
         warning_count += create_indexes(db_cursor, warning_handler)
-        post_import_stats = apply_post_import_rules(database_name, db_cursor, db_conn, log_handler)
+        timings["index_seconds"] = time.perf_counter() - index_started_at
 
+        post_import_started_at = time.perf_counter()
+        post_import_stats = apply_post_import_rules(database_name, db_cursor, db_conn, log_handler)
+        timings["post_import_seconds"] = time.perf_counter() - post_import_started_at
+
+        commit_started_at = time.perf_counter()
         db_conn.commit()
+        timings["commit_seconds"] = time.perf_counter() - commit_started_at
+        timings["total_seconds"] = time.perf_counter() - import_started_at
+
         report_item["success"] = True
         report_item["warning_count"] = warning_count
         report_item["cleanup"] = post_import_stats.get("cleanup", {})
         report_item["interpolation"] = post_import_stats.get("interpolation", {})
+        report_item["timings"] = timings
+
+        timings_message = (
+            f"Timing for {database_name}: "
+            f"schema={timings['schema_seconds']:.2f}s, "
+            f"download={timings['download_seconds']:.2f}s, "
+            f"copy={timings['copy_seconds']:.2f}s, "
+            f"index={timings['index_seconds']:.2f}s, "
+            f"post={timings['post_import_seconds']:.2f}s, "
+            f"commit={timings['commit_seconds']:.2f}s, "
+            f"total={timings['total_seconds']:.2f}s"
+        )
+        print(timings_message)
+        safe_log_message(admin_conn, timings_message, level="INFO")
 
         if warning_count > 0:
             success_message = (
@@ -601,6 +659,8 @@ def import_subdir(subdir, admin_conn):
 
         error_message = f"Import failed for {database_name}: {err}"
         print(error_message)
+        timings["total_seconds"] = time.perf_counter() - import_started_at
+        report_item["timings"] = timings
         safe_log_message(admin_conn, error_message, level="ERROR")
         return report_item, admin_conn
     finally:

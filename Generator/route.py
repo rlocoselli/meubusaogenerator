@@ -3,7 +3,6 @@ import util.createColumnDoesNotExist
 
 def insert(file, c):
     print(file)
-    c.execute("delete from route")
     c.execute("ALTER TABLE route ADD COLUMN IF NOT EXISTS favorite integer")
 
     try:
