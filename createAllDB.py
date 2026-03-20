@@ -241,15 +241,127 @@ def create_indexes(cursor, warning_handler):
     return warning_count
 
 
+def validate_and_clean_stop_times(database_name, cursor, log_handler):
+    """Apply lightweight cleanup and consistency fixes on stopstime data."""
+    # Normalize blank strings to NULL and trim surrounding spaces.
+    cursor.execute(
+        """
+        UPDATE stopstime
+        SET
+            trip_id = NULLIF(BTRIM(trip_id), ''),
+            stop_id = NULLIF(BTRIM(stop_id), ''),
+            arrival_time = NULLIF(BTRIM(arrival_time), ''),
+            departure_time = NULLIF(BTRIM(departure_time), '')
+        """
+    )
+
+    cursor.execute(
+        """
+        UPDATE stopstime
+        SET
+            arrival_time = departure_time
+        WHERE arrival_time IS NULL
+          AND departure_time IS NOT NULL
+        """
+    )
+    mirrored_arrivals = cursor.rowcount
+
+    cursor.execute(
+        """
+        UPDATE stopstime
+        SET
+            departure_time = arrival_time
+        WHERE departure_time IS NULL
+          AND arrival_time IS NOT NULL
+        """
+    )
+    mirrored_departures = cursor.rowcount
+
+    cursor.execute(
+        """
+        DELETE FROM stopstime
+        WHERE trip_id IS NULL
+           OR stop_id IS NULL
+           OR stop_sequence IS NULL
+        """
+    )
+    removed_invalid_rows = cursor.rowcount
+
+    cursor.execute(
+        """
+        WITH ranked AS (
+            SELECT ctid,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY trip_id, stop_sequence
+                       ORDER BY ctid
+                   ) AS rn
+            FROM stopstime
+        )
+        DELETE FROM stopstime s
+        USING ranked r
+        WHERE s.ctid = r.ctid
+          AND r.rn > 1
+        """
+    )
+    removed_duplicates = cursor.rowcount
+
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM stopstime
+        WHERE (
+            arrival_time IS NOT NULL
+            AND arrival_time !~ '^\\d+:\\d{2}:\\d{2}$'
+        ) OR (
+            departure_time IS NOT NULL
+            AND departure_time !~ '^\\d+:\\d{2}:\\d{2}$'
+        )
+        """
+    )
+    invalid_time_rows = cursor.fetchone()[0]
+
+    if invalid_time_rows > 0:
+        log_handler(
+            (
+                f"Detected {invalid_time_rows} stopstime row(s) with non GTFS-like "
+                "time format (expected H+:MM:SS)"
+            ),
+            level="WARNING",
+        )
+
+    if (
+        mirrored_arrivals > 0
+        or mirrored_departures > 0
+        or removed_invalid_rows > 0
+        or removed_duplicates > 0
+    ):
+        log_handler(
+            (
+                f"stopstime cleanup for {database_name}: mirrored_arrivals={mirrored_arrivals}, "
+                f"mirrored_departures={mirrored_departures}, removed_invalid_rows={removed_invalid_rows}, "
+                f"removed_duplicates={removed_duplicates}"
+            ),
+            level="INFO",
+        )
+
+
 def apply_post_import_rules(database_name, cursor, conn, log_handler):
-    if database_name != PORTO_ALEGRE_DATABASE:
-        return
+    validate_and_clean_stop_times(database_name, cursor, log_handler)
 
     updated_rows = GenerateTimes(cursor, conn, None, None)
-    log_handler(
-        f"Interpolated missing stop times for {database_name} ({updated_rows} stop row(s) updated)",
-        level="INFO",
-    )
+    if database_name == PORTO_ALEGRE_DATABASE:
+        log_handler(
+            f"Interpolated missing stop times for {database_name} ({updated_rows} stop row(s) updated)",
+            level="INFO",
+        )
+    elif updated_rows > 0:
+        log_handler(
+            (
+                f"Applied Porto Alegre-like interpolation rule for {database_name} "
+                f"({updated_rows} stop row(s) updated)"
+            ),
+            level="INFO",
+        )
 
 
 def import_subdir(subdir, admin_conn):

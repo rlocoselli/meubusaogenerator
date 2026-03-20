@@ -142,7 +142,13 @@ def GenerateTimes(c, conn, startPoint=None, endPoint=None):
                         split_part(last_stop_time, ':', 1)::integer * 3600
                         + split_part(last_stop_time, ':', 2)::integer * 60
                         + split_part(last_stop_time, ':', 3)::integer
-                END AS last_stop_seconds
+                END AS last_stop_seconds,
+                CASE
+                    WHEN COALESCE(arrival_time, departure_time) ~ '^\\d+:\\d{2}:\\d{2}$' THEN
+                        split_part(COALESCE(arrival_time, departure_time), ':', 1)::integer * 3600
+                        + split_part(COALESCE(arrival_time, departure_time), ':', 2)::integer * 60
+                        + split_part(COALESCE(arrival_time, departure_time), ':', 3)::integer
+                END AS known_time_seconds
             FROM distances
         ),
         interpolated AS (
@@ -165,14 +171,114 @@ def GenerateTimes(c, conn, startPoint=None, endPoint=None):
                 END AS total_duration_seconds
             FROM metrics
         ),
-        estimated_times AS (
+        anchored AS (
             SELECT
                 interpolated.*,
+                MAX(
+                    CASE
+                        WHEN known_time_seconds IS NOT NULL THEN stop_sequence
+                    END
+                ) OVER (
+                    PARTITION BY trip_id
+                    ORDER BY stop_sequence
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) AS prev_known_sequence,
+                MAX(
+                    CASE
+                        WHEN known_time_seconds IS NOT NULL THEN cumulative_distance
+                    END
+                ) OVER (
+                    PARTITION BY trip_id
+                    ORDER BY stop_sequence
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) AS prev_known_cumulative_distance,
+                MAX(
+                    CASE
+                        WHEN known_time_seconds IS NOT NULL THEN known_time_seconds
+                    END
+                ) OVER (
+                    PARTITION BY trip_id
+                    ORDER BY stop_sequence
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) AS prev_known_seconds,
+                MIN(
+                    CASE
+                        WHEN known_time_seconds IS NOT NULL THEN stop_sequence
+                    END
+                ) OVER (
+                    PARTITION BY trip_id
+                    ORDER BY stop_sequence
+                    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+                ) AS next_known_sequence,
+                MIN(
+                    CASE
+                        WHEN known_time_seconds IS NOT NULL THEN cumulative_distance
+                    END
+                ) OVER (
+                    PARTITION BY trip_id
+                    ORDER BY stop_sequence
+                    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+                ) AS next_known_cumulative_distance,
+                MIN(
+                    CASE
+                        WHEN known_time_seconds IS NOT NULL THEN known_time_seconds
+                    END
+                ) OVER (
+                    PARTITION BY trip_id
+                    ORDER BY stop_sequence
+                    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+                ) AS next_known_seconds
+            FROM interpolated
+        ),
+        estimated_times AS (
+            SELECT
+                anchored.*,
                 CASE
+                    WHEN known_time_seconds IS NOT NULL THEN known_time_seconds
+                    WHEN prev_known_seconds IS NOT NULL
+                         AND next_known_seconds IS NOT NULL
+                         AND next_known_sequence > prev_known_sequence THEN
+                        CASE
+                            WHEN next_known_cumulative_distance > prev_known_cumulative_distance THEN
+                                prev_known_seconds
+                                + ROUND(
+                                    (
+                                        CASE
+                                            WHEN next_known_seconds >= prev_known_seconds THEN
+                                                next_known_seconds - prev_known_seconds
+                                            ELSE
+                                                next_known_seconds + 86400 - prev_known_seconds
+                                        END
+                                    )
+                                    * (
+                                        (cumulative_distance - prev_known_cumulative_distance)
+                                        / NULLIF(
+                                            next_known_cumulative_distance - prev_known_cumulative_distance,
+                                            0
+                                        )
+                                    )
+                                )::integer
+                            ELSE
+                                prev_known_seconds
+                                + ROUND(
+                                    (
+                                        CASE
+                                            WHEN next_known_seconds >= prev_known_seconds THEN
+                                                next_known_seconds - prev_known_seconds
+                                            ELSE
+                                                next_known_seconds + 86400 - prev_known_seconds
+                                        END
+                                    )
+                                    * (
+                                        (stop_rank - prev_known_sequence)::double precision
+                                        / NULLIF(next_known_sequence - prev_known_sequence, 0)
+                                    )
+                                )::integer
+                        END
                     WHEN total_duration_seconds IS NULL THEN NULL
                     ELSE first_stop_seconds + ROUND(total_duration_seconds * progress_ratio)::integer
                 END AS estimated_time_seconds
-            FROM interpolated
+            FROM anchored
         ),
         updated_rows AS (
             UPDATE stopstime target
