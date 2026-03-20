@@ -305,14 +305,33 @@ def GenerateTimes(c, conn, startPoint=None, endPoint=None):
               AND estimated_times.has_missing_intermediate_times = 1
               AND estimated_times.first_stop_seconds IS NOT NULL
               AND estimated_times.last_stop_seconds IS NOT NULL
-            RETURNING 1
+            RETURNING CASE
+                WHEN estimated_times.known_time_seconds IS NULL
+                     AND estimated_times.prev_known_seconds IS NOT NULL
+                     AND estimated_times.next_known_seconds IS NOT NULL
+                     AND estimated_times.next_known_sequence > estimated_times.prev_known_sequence
+                    THEN 'local_anchor'
+                WHEN estimated_times.known_time_seconds IS NULL
+                    THEN 'global_fallback'
+                ELSE 'existing_time'
+            END AS interpolation_mode
         )
-        SELECT COUNT(*)
+        SELECT
+            COUNT(*) AS updated_rows,
+            COALESCE(SUM(CASE WHEN interpolation_mode = 'local_anchor' THEN 1 ELSE 0 END), 0) AS local_anchor_rows,
+            COALESCE(SUM(CASE WHEN interpolation_mode = 'global_fallback' THEN 1 ELSE 0 END), 0) AS global_fallback_rows
         FROM updated_rows
         """,
         params,
     )
 
-    updated_rows = c.fetchone()[0]
-    print(f"Interpolated stop times for {updated_rows} stop rows")
-    return updated_rows
+    updated_rows, local_anchor_rows, global_fallback_rows = c.fetchone()
+    print(
+        "Interpolated stop times "
+        f"(total={updated_rows}, local_anchor={local_anchor_rows}, global_fallback={global_fallback_rows})"
+    )
+    return {
+        "updated_rows": updated_rows,
+        "local_anchor_rows": local_anchor_rows,
+        "global_fallback_rows": global_fallback_rows,
+    }

@@ -28,6 +28,17 @@ def should_process_database(database_name, included_databases=None, excluded_dat
 
     return True
 
+
+def _is_github_actions():
+    return os.environ.get("GITHUB_ACTIONS", "").strip().lower() == "true"
+
+
+def gha_notice(message):
+    if _is_github_actions():
+        print(f"::notice::{message}")
+    else:
+        print(message)
+
 def create_log_table(cursor):
     create_table_query = """
     CREATE TABLE IF NOT EXISTS log (
@@ -344,29 +355,143 @@ def validate_and_clean_stop_times(database_name, cursor, log_handler):
             level="INFO",
         )
 
+    return {
+        "mirrored_arrivals": mirrored_arrivals,
+        "mirrored_departures": mirrored_departures,
+        "removed_invalid_rows": removed_invalid_rows,
+        "removed_duplicates": removed_duplicates,
+        "invalid_time_rows": invalid_time_rows,
+    }
+
 
 def apply_post_import_rules(database_name, cursor, conn, log_handler):
-    validate_and_clean_stop_times(database_name, cursor, log_handler)
+    cleanup_stats = validate_and_clean_stop_times(database_name, cursor, log_handler)
 
-    updated_rows = GenerateTimes(cursor, conn, None, None)
+    interpolation_stats = GenerateTimes(cursor, conn, None, None)
+    updated_rows = interpolation_stats["updated_rows"]
+    local_anchor_rows = interpolation_stats["local_anchor_rows"]
+    global_fallback_rows = interpolation_stats["global_fallback_rows"]
+
     if database_name == PORTO_ALEGRE_DATABASE:
         log_handler(
-            f"Interpolated missing stop times for {database_name} ({updated_rows} stop row(s) updated)",
+            (
+                f"Interpolated missing stop times for {database_name} "
+                f"(updated={updated_rows}, local_anchor={local_anchor_rows}, "
+                f"global_fallback={global_fallback_rows})"
+            ),
             level="INFO",
         )
     elif updated_rows > 0:
         log_handler(
             (
                 f"Applied Porto Alegre-like interpolation rule for {database_name} "
-                f"({updated_rows} stop row(s) updated)"
+                f"(updated={updated_rows}, local_anchor={local_anchor_rows}, "
+                f"global_fallback={global_fallback_rows})"
             ),
             level="INFO",
         )
+
+    return {
+        "cleanup": cleanup_stats,
+        "interpolation": interpolation_stats,
+    }
+
+
+def _build_report_markdown(report_items):
+    lines = [
+        "## GTFS Validation Report",
+        "",
+        "| Database | Status | Warnings | Mirrored Arrivals | Mirrored Departures | Invalid Rows Removed | Duplicates Removed | Invalid Time Format Rows | Interpolated Total | Local Anchor | Global Fallback |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+
+    for item in report_items:
+        cleanup = item.get("cleanup", {})
+        interpolation = item.get("interpolation", {})
+        status = "SUCCESS" if item.get("success") else "FAILED"
+
+        lines.append(
+            "| {database} | {status} | {warnings} | {mirrored_arrivals} | "
+            "{mirrored_departures} | {removed_invalid_rows} | {removed_duplicates} | "
+            "{invalid_time_rows} | {updated_rows} | {local_anchor_rows} | {global_fallback_rows} |".format(
+                database=item.get("database", "unknown"),
+                status=status,
+                warnings=item.get("warning_count", 0),
+                mirrored_arrivals=cleanup.get("mirrored_arrivals", 0),
+                mirrored_departures=cleanup.get("mirrored_departures", 0),
+                removed_invalid_rows=cleanup.get("removed_invalid_rows", 0),
+                removed_duplicates=cleanup.get("removed_duplicates", 0),
+                invalid_time_rows=cleanup.get("invalid_time_rows", 0),
+                updated_rows=interpolation.get("updated_rows", 0),
+                local_anchor_rows=interpolation.get("local_anchor_rows", 0),
+                global_fallback_rows=interpolation.get("global_fallback_rows", 0),
+            )
+        )
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _build_progress_markdown(total, processed, succeeded, failed, current_database=None):
+    if total <= 0:
+        percent = 0
+        filled = 0
+    else:
+        percent = int((processed / total) * 100)
+        filled = int((processed / total) * 20)
+
+    bar = "#" * filled + "-" * (20 - filled)
+
+    lines = [
+        "## GTFS Import Progress",
+        "",
+        f"- Processed: **{processed}/{total}** ({percent}%)",
+        f"- Progress bar: [{bar}]",
+        f"- Succeeded: **{succeeded}**",
+        f"- Failed: **{failed}**",
+    ]
+
+    if current_database:
+        lines.append(f"- Current database: **{current_database}**")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def publish_report_summary(report_items, total=0, processed=0, succeeded=0, failed=0, current_database=None):
+    progress_markdown = _build_progress_markdown(
+        total=total,
+        processed=processed,
+        succeeded=succeeded,
+        failed=failed,
+        current_database=current_database,
+    )
+    report_markdown = _build_report_markdown(report_items)
+    summary_content = progress_markdown + report_markdown
+    print(summary_content)
+
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "").strip()
+    if not summary_path:
+        return
+
+    try:
+        with open(summary_path, "w", encoding="utf8") as summary_file:
+            summary_file.write(summary_content)
+            summary_file.write("\n")
+    except Exception as err:
+        print(f"Warning: unable to write GitHub step summary: {err}")
 
 
 def import_subdir(subdir, admin_conn):
     database_name = subdir.replace("./", "")
     url_file_path = os.path.join(subdir, "url.txt")
+    report_item = {
+        "database": database_name,
+        "success": False,
+        "warning_count": 0,
+        "cleanup": {},
+        "interpolation": {},
+    }
 
     def log_handler(message, level="WARNING"):
         full_message = f"[{database_name}] {message}"
@@ -381,7 +506,7 @@ def import_subdir(subdir, admin_conn):
             message = f"url.txt not found in {subdir}"
             print(message)
             log_message(admin_cursor, message, level="ERROR")
-            return False
+            return report_item
 
         create_database_if_needed(admin_cursor, database_name)
 
@@ -403,9 +528,14 @@ def import_subdir(subdir, admin_conn):
             fix_expired_calendar(db_cursor, database_name, warning_handler)
 
         warning_count += create_indexes(db_cursor, warning_handler)
-        apply_post_import_rules(database_name, db_cursor, db_conn, log_handler)
+        post_import_stats = apply_post_import_rules(database_name, db_cursor, db_conn, log_handler)
 
         db_conn.commit()
+        report_item["success"] = True
+        report_item["warning_count"] = warning_count
+        report_item["cleanup"] = post_import_stats.get("cleanup", {})
+        report_item["interpolation"] = post_import_stats.get("interpolation", {})
+
         if warning_count > 0:
             success_message = (
                 f"Import completed with warnings for {database_name} "
@@ -416,7 +546,7 @@ def import_subdir(subdir, admin_conn):
 
         print(success_message)
         safe_log_message(admin_conn, success_message, level="INFO")
-        return True
+        return report_item
     except Exception as err:
         if db_conn is not None:
             db_conn.rollback()
@@ -424,7 +554,7 @@ def import_subdir(subdir, admin_conn):
         error_message = f"Import failed for {database_name}: {err}"
         print(error_message)
         safe_log_message(admin_conn, error_message, level="ERROR")
-        return False
+        return report_item
     finally:
         if db_cursor is not None:
             db_cursor.close()
@@ -436,34 +566,69 @@ def main():
     subdirs = [x[0] for x in os.walk(".")]
     included_databases = _parse_database_filter_env("INCLUDED_DATABASES")
     excluded_databases = _parse_database_filter_env("EXCLUDED_DATABASES")
+    databases_to_process = []
+    for subdir in subdirs:
+        if "_" not in subdir or "__pycache__" in subdir:
+            continue
+
+        database_name = subdir.replace("./", "")
+        if not should_process_database(
+            database_name,
+            included_databases=included_databases,
+            excluded_databases=excluded_databases,
+        ):
+            continue
+
+        databases_to_process.append(subdir)
+
+    total = len(databases_to_process)
     admin_conn = getConnection("postgres")
 
     try:
         with admin_conn.cursor() as cursor:
             create_log_table(cursor)
 
-        total = 0
+        processed = 0
         succeeded = 0
+        failed = 0
+        report_items = []
 
-        for subdir in subdirs:
-            if "_" not in subdir or "__pycache__" in subdir:
-                continue
+        gha_notice(f"GTFS import started for {total} database(s)")
 
+        if total > 0:
+            publish_report_summary(
+                report_items,
+                total=total,
+                processed=processed,
+                succeeded=succeeded,
+                failed=failed,
+            )
+
+        for subdir in databases_to_process:
             database_name = subdir.replace("./", "")
-            if not should_process_database(
-                database_name,
-                included_databases=included_databases,
-                excluded_databases=excluded_databases,
-            ):
-                print(f"Skipping import for {subdir}")
-                continue
-
-            total += 1
+            gha_notice(f"Starting import for {database_name}")
             print(f"Starting import for {subdir}")
-            if import_subdir(subdir, admin_conn):
+            report_item = import_subdir(subdir, admin_conn)
+            report_items.append(report_item)
+            processed += 1
+            if report_item.get("success"):
                 succeeded += 1
+                gha_notice(f"Completed import for {database_name} ({processed}/{total})")
+            else:
+                failed += 1
+                gha_notice(f"Failed import for {database_name} ({processed}/{total})")
+
+            publish_report_summary(
+                report_items,
+                total=total,
+                processed=processed,
+                succeeded=succeeded,
+                failed=failed,
+                current_database=database_name,
+            )
 
         print(f"Import finished. Success: {succeeded}/{total}")
+        gha_notice(f"GTFS import finished. Success: {succeeded}/{total}, Failed: {failed}")
     finally:
         admin_conn.close()
 

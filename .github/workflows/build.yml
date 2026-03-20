@@ -36,6 +36,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Initialize deployment summary
+        run: |
+          echo "# GTFS Deployment" > "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Run ID: $GITHUB_RUN_ID" >> "$GITHUB_STEP_SUMMARY"
+          echo "Triggered by: $GITHUB_EVENT_NAME" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -45,7 +53,7 @@ jobs:
 
       - name: Deploy database
         run: |
-          python3 createAllDB.py
+          PYTHONUNBUFFERED=1 python3 createAllDB.py
 
   deploy-porto-alegre:
     name: Deploy Porto Alegre Database
@@ -60,6 +68,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Initialize deployment summary
+        run: |
+          echo "# GTFS Deployment" > "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Run ID: $GITHUB_RUN_ID" >> "$GITHUB_STEP_SUMMARY"
+          echo "Triggered by: $GITHUB_EVENT_NAME" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -69,4 +85,4 @@ jobs:
 
       - name: Deploy Porto Alegre database
         run: |
-          python3 createAllDB.py
+          PYTHONUNBUFFERED=1 python3 createAllDB.py
