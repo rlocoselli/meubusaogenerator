@@ -31,6 +31,9 @@ MERGE_GTFS_FILES = [
     "trips.txt",
 ]
 
+# Avoid expensive duplicate cleanup on very large feeds in constrained CI PostgreSQL.
+STOPSTIME_DEDUP_MAX_ROWS = 1_500_000
+
 
 def _parse_database_filter_env(var_name):
     raw_value = os.environ.get(var_name, "")
@@ -542,6 +545,9 @@ def create_indexes(cursor, warning_handler):
 
 def validate_and_clean_stop_times(database_name, cursor, log_handler):
     """Apply lightweight cleanup and consistency fixes on stopstime data."""
+    cursor.execute("SELECT COUNT(*) FROM stopstime")
+    total_stopstime_rows = cursor.fetchone()[0]
+
     # Normalize blank strings to NULL and trim surrounding spaces.
     cursor.execute(
         """
@@ -551,6 +557,11 @@ def validate_and_clean_stop_times(database_name, cursor, log_handler):
             stop_id = NULLIF(BTRIM(stop_id), ''),
             arrival_time = NULLIF(BTRIM(arrival_time), ''),
             departure_time = NULLIF(BTRIM(departure_time), '')
+        WHERE
+            trip_id <> NULLIF(BTRIM(trip_id), '')
+            OR stop_id <> NULLIF(BTRIM(stop_id), '')
+            OR arrival_time <> NULLIF(BTRIM(arrival_time), '')
+            OR departure_time <> NULLIF(BTRIM(departure_time), '')
         """
     )
 
@@ -586,23 +597,33 @@ def validate_and_clean_stop_times(database_name, cursor, log_handler):
     )
     removed_invalid_rows = cursor.rowcount
 
-    cursor.execute(
-        """
-        WITH ranked AS (
-            SELECT ctid,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY trip_id, stop_sequence
-                       ORDER BY ctid
-                   ) AS rn
-            FROM stopstime
+    if total_stopstime_rows <= STOPSTIME_DEDUP_MAX_ROWS:
+        cursor.execute(
+            """
+            WITH ranked AS (
+                SELECT ctid,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY trip_id, stop_sequence
+                           ORDER BY ctid
+                       ) AS rn
+                FROM stopstime
+            )
+            DELETE FROM stopstime s
+            USING ranked r
+            WHERE s.ctid = r.ctid
+              AND r.rn > 1
+            """
         )
-        DELETE FROM stopstime s
-        USING ranked r
-        WHERE s.ctid = r.ctid
-          AND r.rn > 1
-        """
-    )
-    removed_duplicates = cursor.rowcount
+        removed_duplicates = cursor.rowcount
+    else:
+        removed_duplicates = 0
+        log_handler(
+            (
+                f"Skipped duplicate cleanup for {database_name}: stopstime has "
+                f"{total_stopstime_rows} rows (> {STOPSTIME_DEDUP_MAX_ROWS})"
+            ),
+            level="WARNING",
+        )
 
     cursor.execute(
         """
@@ -917,8 +938,11 @@ def import_subdir(subdir, admin_conn):
         safe_log_message(admin_conn, success_message, level="INFO")
         return report_item, admin_conn
     except Exception as err:
-        if db_conn is not None:
-            db_conn.rollback()
+        if db_conn is not None and db_conn.closed == 0:
+            try:
+                db_conn.rollback()
+            except Exception as rollback_err:
+                log_handler(f"Rollback skipped: {rollback_err}", level="WARNING")
 
         error_message = f"Import failed for {database_name}: {err}"
         print(error_message)
@@ -930,8 +954,11 @@ def import_subdir(subdir, admin_conn):
         return report_item, admin_conn
     finally:
         if db_cursor is not None:
-            db_cursor.close()
-        if db_conn is not None:
+            try:
+                db_cursor.close()
+            except Exception:
+                pass
+        if db_conn is not None and db_conn.closed == 0:
             db_conn.close()
 
 
