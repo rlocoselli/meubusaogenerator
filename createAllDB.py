@@ -57,6 +57,16 @@ def gha_notice(message):
     else:
         print(message)
 
+
+def gha_warning(message):
+    if _is_github_actions():
+        print(f"::warning::{message}")
+
+
+def gha_error(message):
+    if _is_github_actions():
+        print(f"::error::{message}")
+
 def create_log_table(cursor):
     create_table_query = """
     CREATE TABLE IF NOT EXISTS log (
@@ -384,25 +394,34 @@ def read_feed_urls(url_file_path):
     return urls
 
 
+def _count_table_rows(cursor, table_name):
+    cursor.execute(sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(table_name)))
+    return cursor.fetchone()[0]
+
+
 def insert_data_from_generator(subdir, cursor, warning_handler):
     import_steps = [
-        ("calendar_dates.txt", calendar_dates.insert, False),
-        ("calendar.txt", calendar.insert, False),
-        ("fare_attributes.txt", fare.insert, False),
-        ("routes.txt", route.insert, True),
-        ("shapes.txt", shape.insert, False),
-        ("stops.txt", stops.insert, True),
-        ("stop_times.txt", stopstimes.insert, True),
-        ("trips.txt", trip.insert, True),
+        ("calendar_dates.txt", calendar_dates.insert, False, "calendar_dates"),
+        ("calendar.txt", calendar.insert, False, "calendar"),
+        ("fare_attributes.txt", fare.insert, False, "fare_attributes"),
+        ("routes.txt", route.insert, True, "route"),
+        ("shapes.txt", shape.insert, False, "shape"),
+        ("stops.txt", stops.insert, True, "stops"),
+        ("stop_times.txt", stopstimes.insert, True, "stopstime"),
+        ("trips.txt", trip.insert, True, "trip"),
     ]
 
     warning_count = 0
+    required_failures = []
+    table_row_counts = {}
 
-    for index, (filename, loader, required) in enumerate(import_steps, start=1):
+    for index, (filename, loader, required, table_name) in enumerate(import_steps, start=1):
         file_path = os.path.join(subdir, filename)
         if not os.path.exists(file_path):
             if required:
-                warning_handler(f"Required file missing for import: {file_path}")
+                failure_message = f"Required file missing for import: {file_path}"
+                warning_handler(failure_message)
+                required_failures.append(failure_message)
                 warning_count += 1
                 continue
 
@@ -415,18 +434,36 @@ def insert_data_from_generator(subdir, cursor, warning_handler):
 
         try:
             loader(file_path, cursor)
+            imported_rows = _count_table_rows(cursor, table_name)
+            table_row_counts[table_name] = imported_rows
+            if required and imported_rows <= 0:
+                failure_message = (
+                    f"Required import produced 0 rows for {file_path} into table {table_name}"
+                )
+                required_failures.append(failure_message)
+                warning_handler(failure_message)
+                warning_count += 1
         except Exception as err:
             cursor.execute(
                 sql.SQL("ROLLBACK TO SAVEPOINT {}").format(sql.Identifier(savepoint_name))
             )
-            warning_handler(f"Failed importing {file_path}: {err}")
+            failure_message = f"Failed importing {file_path} into {table_name}: {err}"
+            warning_handler(failure_message)
+            if required:
+                required_failures.append(failure_message)
             warning_count += 1
         finally:
             cursor.execute(
                 sql.SQL("RELEASE SAVEPOINT {}").format(sql.Identifier(savepoint_name))
             )
 
-    return warning_count
+    if required_failures:
+        raise RuntimeError("; ".join(required_failures))
+
+    return {
+        "warning_count": warning_count,
+        "table_row_counts": table_row_counts,
+    }
 
 
 # Databases whose GTFS calendar end_date should be extended to far-future
@@ -655,24 +692,27 @@ def _build_report_markdown(report_items):
     lines = [
         "## GTFS Validation Report",
         "",
-        "| Database | Status | Warnings | Mirrored Arrivals | Mirrored Departures | Invalid Rows Removed | Duplicates Removed | Invalid Time Format Rows | Interpolated Total | Local Anchor | Global Fallback | Download(s) | Copy(s) | Index(s) | Post(s) | Total(s) |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Database | Status | Warnings | Rows Imported | Mirrored Arrivals | Mirrored Departures | Invalid Rows Removed | Duplicates Removed | Invalid Time Format Rows | Interpolated Total | Local Anchor | Global Fallback | Download(s) | Copy(s) | Index(s) | Post(s) | Total(s) |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
 
     for item in report_items:
         cleanup = item.get("cleanup", {})
         interpolation = item.get("interpolation", {})
         timings = item.get("timings", {})
+        table_row_counts = item.get("table_row_counts", {})
         status = "SUCCESS" if item.get("success") else "FAILED"
+        rows_imported = sum(table_row_counts.values())
 
         lines.append(
-            "| {database} | {status} | {warnings} | {mirrored_arrivals} | "
+            "| {database} | {status} | {warnings} | {rows_imported} | {mirrored_arrivals} | "
             "{mirrored_departures} | {removed_invalid_rows} | {removed_duplicates} | "
             "{invalid_time_rows} | {updated_rows} | {local_anchor_rows} | {global_fallback_rows} | "
             "{download_seconds} | {copy_seconds} | {index_seconds} | {post_import_seconds} | {total_seconds} |".format(
                 database=item.get("database", "unknown"),
                 status=status,
                 warnings=item.get("warning_count", 0),
+                rows_imported=rows_imported,
                 mirrored_arrivals=cleanup.get("mirrored_arrivals", 0),
                 mirrored_departures=cleanup.get("mirrored_departures", 0),
                 removed_invalid_rows=cleanup.get("removed_invalid_rows", 0),
@@ -688,6 +728,18 @@ def _build_report_markdown(report_items):
                 total_seconds=f"{timings.get('total_seconds', 0.0):.2f}",
             )
         )
+
+        if table_row_counts:
+            counts_text = ", ".join(
+                f"{table}={count}" for table, count in sorted(table_row_counts.items())
+            )
+            lines.append(f"Rows by table for {item.get('database', 'unknown')}: {counts_text}")
+
+        if item.get("error_message"):
+            lines.append(f"Error for {item.get('database', 'unknown')}: {item['error_message']}")
+
+        for warning in item.get("warnings", []):
+            lines.append(f"Warning for {item.get('database', 'unknown')}: {warning}")
 
     lines.append("")
     return "\n".join(lines)
@@ -753,12 +805,20 @@ def import_subdir(subdir, admin_conn):
         "warning_count": 0,
         "cleanup": {},
         "interpolation": {},
+        "table_row_counts": {},
+        "warnings": [],
+        "error_message": "",
         "timings": {},
     }
 
     def log_handler(message, level="WARNING"):
         full_message = f"[{database_name}] {message}"
         print(full_message)
+        if level == "WARNING":
+            report_item["warnings"].append(message)
+            gha_warning(full_message)
+        elif level == "ERROR":
+            gha_error(full_message)
         safe_log_message(admin_conn, full_message, level=level)
 
     def warning_handler(message):
@@ -805,7 +865,9 @@ def import_subdir(subdir, admin_conn):
         timings["download_seconds"] = time.perf_counter() - download_started_at
 
         copy_started_at = time.perf_counter()
-        warning_count += insert_data_from_generator(subdir, db_cursor, warning_handler)
+        copy_stats = insert_data_from_generator(subdir, db_cursor, warning_handler)
+        warning_count += copy_stats["warning_count"]
+        report_item["table_row_counts"] = copy_stats["table_row_counts"]
         timings["copy_seconds"] = time.perf_counter() - copy_started_at
 
         if database_name in _EXTEND_CALENDAR_DATABASES:
@@ -860,7 +922,9 @@ def import_subdir(subdir, admin_conn):
 
         error_message = f"Import failed for {database_name}: {err}"
         print(error_message)
+        gha_error(error_message)
         timings["total_seconds"] = time.perf_counter() - import_started_at
+        report_item["error_message"] = str(err)
         report_item["timings"] = timings
         safe_log_message(admin_conn, error_message, level="ERROR")
         return report_item, admin_conn
