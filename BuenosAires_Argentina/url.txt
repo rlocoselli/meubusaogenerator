@@ -1,0 +1,7 @@
+# Buenos Aires (Ciudad) GTFS feeds
+# The loader will try URLs from top to bottom.
+https://data.buenosaires.gob.ar/dataset/colectivos/resource/373f69ef-f0bb-43e9-91f7-4f8104f7f4a3/download/gtfs-colectivos.zip
+https://data.buenosaires.gob.ar/dataset/subte/resource/9806be15-bf4d-4e90-9f90-4f2f2b1766fa/download/gtfs-subte.zip
+# Alternative mirrors from same portal
+https://data.buenosaires.gob.ar/dataset/colectivos/resource/0bfc7f9d-3f30-4adf-a1eb-5f6f84cae353/download/colectivos.zip
+https://data.buenosaires.gob.ar/dataset/subte/resource/5f59f0c7-9c17-4f5f-8ce0-0057ce76f8b8/download/subte.zip

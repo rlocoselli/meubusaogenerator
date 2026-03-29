@@ -1,6 +1,8 @@
 import os
 import re
 import time
+import csv
+import tempfile
 from urllib.parse import urlparse
 import ddl
 from postgresConnection import getConnection
@@ -13,6 +15,21 @@ from psycopg2 import errors, sql
 
 DEFAULT_INSECURE_SSL_HOSTS = {"www.meubusao.com"}
 PORTO_ALEGRE_DATABASE = "PortoAlegre_Brazil"
+MERGE_GTFS_FILES = [
+    "agency.txt",
+    "calendar_dates.txt",
+    "calendar.txt",
+    "fare_attributes.txt",
+    "fare_rules.txt",
+    "feed_info.txt",
+    "frequencies.txt",
+    "routes.txt",
+    "shapes.txt",
+    "stops.txt",
+    "stop_times.txt",
+    "transfers.txt",
+    "trips.txt",
+]
 
 
 def _parse_database_filter_env(var_name):
@@ -139,41 +156,222 @@ def _download_with_ssl_fallback(url, warning_handler):
     return response.content
 
 
+def _source_label_from_url(url, index):
+    parsed = urlparse(url)
+    leaf = os.path.basename(parsed.path).strip()
+    if leaf.lower().endswith(".zip"):
+        leaf = leaf[:-4]
+
+    if not leaf:
+        return f"feed_{index}"
+
+    normalized = re.sub(r"[^a-zA-Z0-9]+", "_", leaf).strip("_").lower()
+    if not normalized:
+        return f"feed_{index}"
+
+    return normalized
+
+
+def _detect_gtfs_root(extracted_dir):
+    best_match = None
+    best_depth = None
+
+    for root, _, files in os.walk(extracted_dir):
+        if not set(files).intersection(MERGE_GTFS_FILES):
+            continue
+
+        relative = os.path.relpath(root, extracted_dir)
+        depth = 0 if relative == "." else relative.count(os.sep) + 1
+        if best_depth is None or depth < best_depth:
+            best_match = root
+            best_depth = depth
+
+    return best_match or extracted_dir
+
+
+def _merge_gtfs_text_files(feed_sources, destination, warning_handler):
+    for filename in MERGE_GTFS_FILES:
+        output_path = os.path.join(destination, filename)
+        if os.path.exists(output_path):
+            os.remove(output_path)
+
+        writer = None
+        output_file = None
+        output_header = None
+        rows_written = 0
+
+        try:
+            for source in feed_sources:
+                input_path = os.path.join(source["dir"], filename)
+                if not os.path.exists(input_path):
+                    continue
+
+                with open(input_path, newline="", encoding="utf8-sig") as csvfile:
+                    reader = csv.DictReader(csvfile)
+                    if not reader.fieldnames:
+                        warning_handler(f"Skipping {input_path}: missing header")
+                        continue
+
+                    if output_header is None:
+                        output_header = list(reader.fieldnames)
+                        if "source_feed" not in output_header:
+                            output_header.append("source_feed")
+                        output_file = open(output_path, "w", newline="", encoding="utf8")
+                        writer = csv.DictWriter(output_file, fieldnames=output_header)
+                        writer.writeheader()
+                    else:
+                        missing_columns = [
+                            column
+                            for column in output_header
+                            if column != "source_feed" and column not in reader.fieldnames
+                        ]
+                        if missing_columns:
+                            warning_handler(
+                                f"{input_path} missing columns for merge: {', '.join(missing_columns)}"
+                            )
+
+                    for row in reader:
+                        normalized_row = {
+                            column: row.get(column, "")
+                            for column in output_header
+                            if column != "source_feed"
+                        }
+                        normalized_row["source_feed"] = source["label"]
+                        writer.writerow(normalized_row)
+                        rows_written += 1
+        finally:
+            if output_file is not None:
+                output_file.close()
+
+        if rows_written > 0:
+            warning_handler(f"Merged {rows_written} rows into {filename}")
+
+
 def download_and_unzip(urls, destination, warning_handler):
     if isinstance(urls, str):
         urls = [urls]
 
     last_error = None
-    downloaded_content = None
-    selected_url = None
+    successful_sources = []
 
-    for candidate_url in urls:
-        try:
-            downloaded_content = _download_with_ssl_fallback(candidate_url, warning_handler)
-            selected_url = candidate_url
-            break
-        except Exception as err:
-            last_error = err
-            warning_handler(f"Failed downloading {candidate_url}: {err}")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        for index, candidate_url in enumerate(urls, start=1):
+            zip_path = os.path.join(temp_dir, f"source_{index}.zip")
+            extract_dir = os.path.join(temp_dir, f"source_{index}")
 
-    if downloaded_content is None:
-        raise RuntimeError(
-            "Unable to download GTFS feed from all configured URLs. "
-            f"Last error: {last_error}"
+            try:
+                downloaded_content = _download_with_ssl_fallback(candidate_url, warning_handler)
+                with open(zip_path, "wb") as zip_file:
+                    zip_file.write(downloaded_content)
+
+                os.makedirs(extract_dir, exist_ok=True)
+                with ZipFile(zip_path, "r") as zip_ref:
+                    zip_ref.extractall(extract_dir)
+
+                gtfs_root = _detect_gtfs_root(extract_dir)
+                successful_sources.append(
+                    {
+                        "url": candidate_url,
+                        "dir": gtfs_root,
+                        "label": _source_label_from_url(candidate_url, index),
+                    }
+                )
+            except BadZipFile as err:
+                last_error = err
+                warning_handler(f"Downloaded file is not a valid zip from URL: {candidate_url}")
+            except Exception as err:
+                last_error = err
+                warning_handler(f"Failed downloading {candidate_url}: {err}")
+
+        if not successful_sources:
+            raise RuntimeError(
+                "Unable to download GTFS feed from all configured URLs. "
+                f"Last error: {last_error}"
+            )
+
+        _merge_gtfs_text_files(successful_sources, destination, warning_handler)
+
+
+def enrich_route_mode_labels(cursor, log_handler):
+    cursor.execute("ALTER TABLE route ADD COLUMN IF NOT EXISTS mode_label TEXT NULL")
+
+    cursor.execute(
+        """
+        WITH typed AS (
+            SELECT ctid, LOWER(BTRIM(route_type)) AS route_type_clean
+            FROM route
         )
+        UPDATE route r
+        SET mode_label = CASE
+            WHEN typed.route_type_clean IS NULL OR typed.route_type_clean = '' THEN 'other'
+            WHEN typed.route_type_clean ~ '^\\d+$' THEN
+                CASE
+                    WHEN typed.route_type_clean::int = 1
+                        OR typed.route_type_clean::int BETWEEN 400 AND 405
+                        THEN 'metro'
+                    WHEN typed.route_type_clean::int = 2
+                        OR typed.route_type_clean::int BETWEEN 100 AND 117
+                        THEN 'tren'
+                    WHEN typed.route_type_clean::int = 3
+                        OR typed.route_type_clean::int = 11
+                        OR typed.route_type_clean::int BETWEEN 700 AND 716
+                        THEN 'bus'
+                    WHEN typed.route_type_clean::int = 0
+                        OR typed.route_type_clean::int BETWEEN 900 AND 906
+                        THEN 'tram'
+                    WHEN typed.route_type_clean::int = 4
+                        OR typed.route_type_clean::int BETWEEN 1200 AND 1204
+                        THEN 'ferry'
+                    ELSE 'other'
+                END
+            WHEN typed.route_type_clean LIKE '%subway%'
+                OR typed.route_type_clean LIKE '%metro%'
+                THEN 'metro'
+            WHEN typed.route_type_clean LIKE '%rail%'
+                OR typed.route_type_clean LIKE '%train%'
+                OR typed.route_type_clean LIKE '%tren%'
+                THEN 'tren'
+            WHEN typed.route_type_clean LIKE '%bus%'
+                OR typed.route_type_clean LIKE '%coach%'
+                THEN 'bus'
+            WHEN typed.route_type_clean LIKE '%tram%'
+                THEN 'tram'
+            WHEN typed.route_type_clean LIKE '%ferry%'
+                OR typed.route_type_clean LIKE '%boat%'
+                THEN 'ferry'
+            ELSE 'other'
+        END
+        FROM typed
+        WHERE r.ctid = typed.ctid
+        """
+    )
 
-    zip_filename = os.path.join(destination, "data.zip")
-    with open(zip_filename, "wb") as f:
-        f.write(downloaded_content)
+    cursor.execute(
+        """
+        SELECT mode_label, COUNT(*)
+        FROM route
+        GROUP BY mode_label
+        ORDER BY COUNT(*) DESC
+        """
+    )
+    counts = ", ".join(f"{row[0]}={row[1]}" for row in cursor.fetchall())
+    log_handler(f"Route mode labels computed: {counts}", level="INFO")
 
-    try:
-        with ZipFile(zip_filename, "r") as zip_ref:
-            zip_ref.extractall(destination)
-    except BadZipFile as err:
-        raise RuntimeError(f"Downloaded file is not a valid zip from URL: {selected_url}") from err
-    finally:
-        if os.path.exists(zip_filename):
-            os.remove(zip_filename)
+
+def create_route_mode_summary_view(cursor, log_handler):
+    cursor.execute(
+        """
+        CREATE OR REPLACE VIEW route_mode_summary AS
+        SELECT
+            COALESCE(NULLIF(BTRIM(mode_label), ''), 'other') AS mode_label,
+            COUNT(*)::bigint AS total_routes,
+            COUNT(DISTINCT COALESCE(NULLIF(BTRIM(source_feed), ''), 'unknown'))::bigint AS total_feeds
+        FROM route
+        GROUP BY COALESCE(NULLIF(BTRIM(mode_label), ''), 'other')
+        ORDER BY total_routes DESC, mode_label ASC
+        """
+    )
+    log_handler("View route_mode_summary refreshed", level="INFO")
 
 
 def read_feed_urls(url_file_path):
@@ -418,6 +616,9 @@ def validate_and_clean_stop_times(database_name, cursor, log_handler):
 
 
 def apply_post_import_rules(database_name, cursor, conn, log_handler):
+    enrich_route_mode_labels(cursor, log_handler)
+    create_route_mode_summary_view(cursor, log_handler)
+
     cleanup_stats = validate_and_clean_stop_times(database_name, cursor, log_handler)
 
     interpolation_stats = GenerateTimes(cursor, conn, None, None)
