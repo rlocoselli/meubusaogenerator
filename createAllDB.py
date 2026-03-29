@@ -216,7 +216,7 @@ def _merge_gtfs_text_files(feed_sources, destination, warning_handler):
                 if not os.path.exists(input_path):
                     continue
 
-                with open(input_path, newline="", encoding="utf8-sig") as csvfile:
+                with open(input_path, newline="", encoding="utf-8-sig") as csvfile:
                     reader = csv.DictReader(csvfile)
                     if not reader.fieldnames:
                         warning_handler(f"Skipping {input_path}: missing header")
