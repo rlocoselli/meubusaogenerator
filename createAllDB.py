@@ -548,6 +548,8 @@ def create_database_if_needed(admin_cursor, database_name):
 
 
 def drop_and_create_tables(cursor):
+    cursor.execute("DROP VIEW IF EXISTS route_mode_summary")
+
     for table in ddl.table_names:
         cursor.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(sql.Identifier(table)))
 
@@ -1086,6 +1088,8 @@ def main():
 
         print(f"Import finished. Success: {succeeded}/{total}")
         gha_notice(f"GTFS import finished. Success: {succeeded}/{total}, Failed: {failed}")
+        if failed:
+            raise RuntimeError(f"{failed} of {total} GTFS imports failed")
     finally:
         admin_conn.close()
 

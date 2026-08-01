@@ -8,6 +8,14 @@ import createAllDB
 
 
 class GtfsSourceTests(unittest.TestCase):
+    def test_schema_reset_drops_owned_view_before_tables(self):
+        cursor = mock.Mock()
+
+        createAllDB.drop_and_create_tables(cursor)
+
+        first_statement = cursor.execute.call_args_list[0].args[0]
+        self.assertEqual(first_statement, "DROP VIEW IF EXISTS route_mode_summary")
+
     def test_missing_url_file_has_no_urls(self):
         with tempfile.TemporaryDirectory() as city_dir:
             self.assertEqual(createAllDB.read_feed_urls(os.path.join(city_dir, "url.txt")), [])
