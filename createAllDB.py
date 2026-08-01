@@ -388,13 +388,63 @@ def create_route_mode_summary_view(cursor, log_handler):
 
 
 def read_feed_urls(url_file_path):
+    if not os.path.exists(url_file_path):
+        return []
+
     with open(url_file_path, "r", encoding="utf8") as url_file:
         urls = [line.strip() for line in url_file if line.strip() and not line.strip().startswith("#")]
 
-    if not urls:
-        raise ValueError(f"URL file is empty: {url_file_path}")
-
     return urls
+
+
+def find_local_feed_zips(subdir):
+    return sorted(
+        os.path.join(subdir, filename)
+        for filename in os.listdir(subdir)
+        if filename.lower().endswith(".zip") and os.path.isfile(os.path.join(subdir, filename))
+    )
+
+
+def extract_local_zips(zip_paths, destination, warning_handler):
+    feed_sources = []
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        for index, zip_path in enumerate(zip_paths, start=1):
+            extract_dir = os.path.join(temp_dir, f"local_source_{index}")
+            os.makedirs(extract_dir, exist_ok=True)
+
+            try:
+                with ZipFile(zip_path, "r") as zip_ref:
+                    zip_ref.extractall(extract_dir)
+            except BadZipFile as err:
+                raise RuntimeError(f"Local GTFS file is not a valid zip: {zip_path}") from err
+
+            feed_sources.append(
+                {
+                    "url": zip_path,
+                    "dir": _detect_gtfs_root(extract_dir),
+                    "label": _source_label_from_url(zip_path, index),
+                }
+            )
+
+        _merge_gtfs_text_files(feed_sources, destination, warning_handler)
+
+
+def load_gtfs_source(subdir, urls, local_zip_paths, warning_handler):
+    if urls:
+        try:
+            download_and_unzip(urls, subdir, warning_handler)
+            return "url"
+        except Exception as err:
+            if not local_zip_paths:
+                raise
+            warning_handler(f"URL sources failed; falling back to local GTFS zip: {err}")
+
+    if local_zip_paths:
+        extract_local_zips(local_zip_paths, subdir, warning_handler)
+        return "local_zip"
+
+    raise RuntimeError(f"No GTFS URLs or local zip files found in {subdir}")
 
 
 def _count_table_rows(cursor, table_name):
@@ -819,6 +869,8 @@ def publish_report_summary(report_items, total=0, processed=0, succeeded=0, fail
 def import_subdir(subdir, admin_conn):
     database_name = subdir.replace("./", "")
     url_file_path = os.path.join(subdir, "url.txt")
+    urls = read_feed_urls(url_file_path)
+    local_zip_paths = find_local_feed_zips(subdir)
     import_started_at = time.perf_counter()
     report_item = {
         "database": database_name,
@@ -848,10 +900,11 @@ def import_subdir(subdir, admin_conn):
     admin_conn = ensure_admin_connection(admin_conn)
 
     with admin_conn.cursor() as admin_cursor:
-        if not os.path.exists(url_file_path):
-            message = f"url.txt not found in {subdir}"
+        if not urls and not local_zip_paths:
+            message = f"No GTFS URLs or local zip files found in {subdir}"
             print(message)
             log_message(admin_cursor, message, level="ERROR")
+            report_item["error_message"] = message
             return report_item, admin_conn
 
         create_database_if_needed(admin_cursor, database_name)
@@ -879,10 +932,9 @@ def import_subdir(subdir, admin_conn):
         drop_and_create_tables(db_cursor)
         timings["schema_seconds"] = time.perf_counter() - schema_started_at
 
-        urls = read_feed_urls(url_file_path)
-
         download_started_at = time.perf_counter()
-        download_and_unzip(urls, subdir, warning_handler)
+        source_type = load_gtfs_source(subdir, urls, local_zip_paths, warning_handler)
+        log_handler(f"Loaded GTFS source from {source_type}", level="INFO")
         timings["download_seconds"] = time.perf_counter() - download_started_at
 
         copy_started_at = time.perf_counter()
@@ -979,6 +1031,10 @@ def main():
         ):
             continue
 
+        url_file_path = os.path.join(subdir, "url.txt")
+        if not read_feed_urls(url_file_path) and not find_local_feed_zips(subdir):
+            continue
+
         databases_to_process.append(subdir)
 
     total = len(databases_to_process)
@@ -1035,4 +1091,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

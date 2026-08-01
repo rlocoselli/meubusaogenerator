@@ -19,7 +19,7 @@ def parse_columns(columns):
 
 def format_copy_columns(columns):
     parsed_columns = parse_columns(columns)
-    return ", ".join(f'"{column.replace("\"", "\"\"")}"' for column in parsed_columns)
+    return ", ".join('"{}"'.format(column.replace('"', '""')) for column in parsed_columns)
 
 
 def createColumn(cursor, columns, table):
