@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 from unittest import mock
 from zipfile import ZipFile
 
@@ -8,6 +9,30 @@ import createAllDB
 
 
 class GtfsSourceTests(unittest.TestCase):
+    def test_canberra_download_uses_environment_credentials(self):
+        response = mock.Mock(content=b"zip", raise_for_status=mock.Mock())
+        with patch.dict(
+            os.environ,
+            {
+                "CANBERRA_GTFS_CLIENT_ID": "client-id",
+                "CANBERRA_GTFS_CLIENT_SECRET": "client-secret",
+            },
+        ), mock.patch.object(createAllDB.requests, "get", return_value=response) as get:
+            createAllDB._download_with_ssl_fallback(
+                "https://transport.api.act.gov.au/gtfs/data/gtfs/v2/google_transit.zip",
+                lambda message: None,
+            )
+
+        self.assertEqual(get.call_args.kwargs["auth"], ("client-id", "client-secret"))
+
+    def test_canberra_download_requires_credentials(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "CANBERRA_GTFS_CLIENT_ID"):
+                createAllDB._download_with_ssl_fallback(
+                    "https://transport.api.act.gov.au/gtfs/data/gtfs/v2/google_transit.zip",
+                    lambda message: None,
+                )
+
     def test_schema_reset_drops_owned_view_before_tables(self):
         cursor = mock.Mock()
 

@@ -14,6 +14,7 @@ from calculateDistanceStopsPostgres import GenerateTimes
 from psycopg2 import errors, sql
 
 DEFAULT_INSECURE_SSL_HOSTS = {"www.meubusao.com"}
+CANBERRA_API_HOST = "transport.api.act.gov.au"
 PORTO_ALEGRE_DATABASE = "PortoAlegre_Brazil"
 MERGE_GTFS_FILES = [
     "agency.txt",
@@ -144,9 +145,20 @@ def _is_insecure_ssl_allowed(url):
 
 def _download_with_ssl_fallback(url, warning_handler):
     verify_ssl = True
+    request_kwargs = {}
+
+    if (urlparse(url).hostname or "").lower() == CANBERRA_API_HOST:
+        client_id = os.environ.get("CANBERRA_GTFS_CLIENT_ID", "").strip()
+        client_secret = os.environ.get("CANBERRA_GTFS_CLIENT_SECRET", "").strip()
+        if not client_id or not client_secret:
+            raise RuntimeError(
+                "Canberra GTFS requires CANBERRA_GTFS_CLIENT_ID and "
+                "CANBERRA_GTFS_CLIENT_SECRET environment variables"
+            )
+        request_kwargs["auth"] = (client_id, client_secret)
 
     try:
-        response = requests.get(url, timeout=60, verify=verify_ssl)
+        response = requests.get(url, timeout=60, verify=verify_ssl, **request_kwargs)
     except requests.exceptions.SSLError as err:
         if not _is_insecure_ssl_allowed(url):
             raise RuntimeError(
@@ -163,7 +175,7 @@ def _download_with_ssl_fallback(url, warning_handler):
         )
         verify_ssl = False
         requests.packages.urllib3.disable_warnings()  # type: ignore[attr-defined]
-        response = requests.get(url, timeout=60, verify=verify_ssl)
+        response = requests.get(url, timeout=60, verify=verify_ssl, **request_kwargs)
 
     response.raise_for_status()
     return response.content

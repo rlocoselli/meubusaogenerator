@@ -20,6 +20,8 @@ env:
   SERVER: ${{ secrets.SERVER }}
   USER: ${{ secrets.USER }}
   MOT: ${{ secrets.MOT }}
+  CANBERRA_GTFS_CLIENT_ID: ${{ secrets.CANBERRA_GTFS_CLIENT_ID }}
+  CANBERRA_GTFS_CLIENT_SECRET: ${{ secrets.CANBERRA_GTFS_CLIENT_SECRET }}
 
 jobs:
   deploy-databases:

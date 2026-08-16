@@ -2,3 +2,7 @@ __pycache__
 venv/
 *.exe
 *.sqbpro
+.env
+.env.*
+!.env.example
+.canberra-secrets
